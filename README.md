@@ -113,8 +113,10 @@ seccore peers ; seccore status
 seccore send tablet '{"note":"hi"}' ; seccore broadcast '{"alert":"x"}' ; seccore inbox
 seccore request box '{"op":"ping"}'
 ```
-If identity/canary are encrypted, the daemon needs `SECCORE_PASSPHRASE` set (or `~/.seccore/passphrase` for the
-Termux service, which weakens the protection; your choice). Off-LAN devices need one reachable host or a network you
+If identity/canary are encrypted, the daemon unlocks, in this order, from `SECCORE_PASSPHRASE`, then the **Android Keystore**
+(`seccore keystore-setup` once; needs the Termux:API app + `pkg install termux-api`), then a TTY prompt. With none of those,
+it starts **locked**: only `/status` and `/unlock` answer (token-protected, loopback) until you run `seccore unlock`.
+No plaintext passphrase file is needed. Off-LAN devices need one reachable host or a network you
 already have between them. seccore doesn't trust the network underneath.
 
 ## Tasks: letting agents on one device run things on another (`tasks.mjs`)
@@ -155,28 +157,83 @@ Per-peer token bucket on messages, requests and relay frames (default 50/s, burs
 `rate limited`), plus a per-IP budget checked *before* the handshake (default 2/s, burst 10). Tune with
 `"limits": {"peerRate":…, "peerBurst":…, "handshakeRate":…, "handshakeBurst":…}` in `mesh.json`.
 
-## Multi-hop relay
-Each node derives a static X25519 "box" key from its identity and publishes it in an announcement signed with Ed25519.
-Announcements gossip over the mesh, so a node learns the box key for any fingerprint and can check its signature.
-A relayed message is an envelope **sealed to the recipient** (ephemeral X25519 → HKDF → ChaCha20-Poly1305, header as AAD) and
-**signed by the sender's** Ed25519 key. Relays forward it (flooding to trusted neighbours, or direct when the destination is
-a neighbour) and only see sender/recipient fingerprints, an id, the TTL and the size. Protections: hop limit (`maxHops`, default 8),
-deduplication by id, loop prevention (path list), and the recipient rejects envelopes older than 5 min. The recipient
-accepts only senders it has pinned (or `"acceptRelayFrom": ["*" | fp…]`).
+## Multi-hop relay (forward-secret) and routing
+Every node publishes a signed **node record**: Ed25519 identity, a sequence number, a **rotating prekey**
+(X25519 + ML-KEM-768, rotated hourly by default) and its list of directly connected peers. Records gossip mesh-wide.
+- **Envelopes** are sealed to the recipient's current prekey (ephemeral X25519 ⊕ ML-KEM encapsulation → HKDF →
+  ChaCha20-Poly1305, header as AAD) and signed by the sender's identity. Prekey private keys exist **only in memory**
+  and are destroyed after the grace window (current + 2 previous), so stealing a device later, identity key included,
+  doesn't decrypt relayed messages captured earlier. A restart also destroys them.
+- **Routing:** link-state. A node runs BFS over edges that *both* ends' signed records confirm (a single forged claim can't
+  create a path). It sends to the next hop, or falls back to flooding (TTL + path loop check) when no route is known. The tables are bounded
+  (`maxDirectory`, 64 neighbours per record), and configured peers can't be crowded out by junk records.
+- **Replay:** relay ids are deduplicated in a persisted, bounded store (`~/.seccore/replay.json`), and envelopes older than 5 min are
+  refused, so replays fail across restarts too.
+
+## Revocation
+`seccore revoke NAME|FP|self [--reason …]` creates a signed notice that gossips mesh-wide. A notice takes effect if it's signed by
+the target itself, by an admin key, or by a quorum of trusted peers (co-signatures merge as it spreads):
+```json
+"revocation": { "admins": ["<admin fp>"], "quorum": 2 }
+```
+Applied revocations are persisted (`revoked.json`). The device is disconnected immediately and refused everywhere: handshakes,
+relay, routing, `retrust`. Revocation is permanent, so to come back a device needs a new key and has to re-pair. Self-revoke from a backup if a phone is
+stolen. With `quorum: 2`, two of your other devices can jointly cut off a compromised one.
+
+## Task sandboxing and audit
+Per-task options in `tasks.json` (on top of the allowlist rules):
+```json
+"cat-note": { "argv": ["cat", "{file}"], "args": { "file": "[^\\u0000]{1,200}" },
+  "pathArgs": { "file": { "roots": ["~/work/notes"], "type": "file" } },
+  "cwd": "~/work", "limits": { "cpuSeconds": 30, "memoryMB": 512, "fileSizeMB": 50, "nproc": 64, "nofile": 256 },
+  "requireLimits": true, "sandbox": { "wrapper": ["proot", "-b", "/data/data/com.termux/files/home/work"] },
+  "peers": ["box"] }
+```
+- `pathArgs`: the value is resolved with `realpath` (symlinks followed) and has to stay inside one of `roots`. `..`, absolute escapes and
+  symlink escapes are refused. `type` can be `file`, `dir` or `any`.
+- `cwd` must exist, and `/` is refused. Give every agent task its own work dir.
+- `limits` are enforced with `prlimit` (`pkg install util-linux`). With `requireLimits`, the task refuses to run without it.
+- `sandbox.wrapper` is a literal argv prefix, e.g. `proot` (`pkg install proot`) to bind-mount only the work dir.
+  Shells can't be wrappers.
+- Jobs run in their own process group, so timeouts and cancels kill the whole tree.
+- **Audit log** `~/.seccore/audit.log`: every start, end and refusal (peer, task, argv, with long args truncated + hashed, exit code,
+  duration), hash-chained and HMAC'd with a key derived from the device identity. `seccore audit-verify` detects edited, deleted or
+  reordered entries. It shows tampering, but can't stop an attacker who fully controls the device from writing new
+  entries.
+
+## Security review notes
+An internal adversarial pass (not an independent audit) fixed:
+- unbounded pre-auth handshake buffering (now 16 KiB frames, ≤4 queued, ≤64 concurrent handshakes, per-IP gate);
+- missing ML-KEM length checks;
+- no TCP connect timeout;
+- `error` events crashing processes without a listener;
+- gossip/canary traffic outside the rate limits (now a separate control budget, billed per signed item);
+- oversized results tearing down links;
+- a NaN timestamp bypassing the relay age check;
+- directory crowd-out;
+- unclamped TTL.
+
+`test/fuzz.test.mjs` throws random and mutated input at the frame/handshake listener, bundles, records, envelopes, secret boxes,
+revocations, task args and every mesh message type.
 
 ## Threat model updates
 - **Compromised relay:** it can't read, forge or alter relayed payloads, but it can drop them, delay them (within 5 min) and see
   who talks to whom, when, and how much.
 - **Compromised peer:** it can do whatever its allowed tasks permit on the devices that granted them. Keep task lists tight and
   regexes narrow. The canary flags nodes that lack the mesh secret, but not an attacker who has fully taken over a node.
-- **Stolen device:** with `encrypt-secrets`, the identity key and canary secret need the passphrase (scrypt, N=2^15). Without it,
-  they sit in plaintext (mode 600). A `passphrase` file for autostart cancels this protection.
+- **Stolen device:** with `encrypt-secrets`, the identity key and canary secret need the passphrase (scrypt, N=2^15). The
+  Keystore unlock binds it to this phone's hardware key, so a thief who unlocks the phone (or roots it) can still use it in place.
+  Revoke the device from another one, or self-revoke, right away.
+- **Past relayed traffic:** protected by prekey rotation and deletion (forward secrecy within the rotation window). Messages
+  sent during the current window can be read if the device is seized *with* the daemon running.
+- **Revocation abuse:** a stolen key can self-revoke (harmless). Admin keys and a quorum can cut devices off, so guard admin keys.
 - **Floods:** rate limits bound CPU spent on handshakes and requests. They don't stop a network-level DoS.
 
 ### Remaining limitations
-- Relay routing floods. That's fine for a handful of devices, but wasteful for large meshes, and there's no route learning yet.
-- Box keys are static (no forward secrecy for *relayed* messages if a node's identity key leaks later). Direct links do have it.
-- Revoking a key means removing it from every device by hand (no signed revocation broadcast yet).
-- Relay envelope replay is limited to 5 min plus an in-memory dedupe that is lost when the node restarts.
-- The prompt-based unlock needs a TTY. Services have to use the env var or the passphrase file.
-- This code isn't independently audited.
+- Relay FS is per prekey window (hourly by default), not per message. There's no Double Ratchet, so no post-compromise
+  self-healing inside a window. Direct links have per-connection FS.
+- Link-state routing is unweighted (hop count) and is recomputed per message, which is fine for tens of nodes.
+- Revocation is permanent and can't be undone. Admin and quorum settings must match on all devices.
+- `prlimit`/`proot` enforcement depends on what's installed. Android doesn't give unprivileged apps namespaces or seccomp.
+- Locked-mode unlock after a crash: the supervisor restarts the node locked again unless the Keystore or the env var is set up.
+- None of this has been independently audited. Fingerprints are 80-bit.

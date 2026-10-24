@@ -3,8 +3,8 @@
 # Usage: bash scripts/termux-setup.sh [--service] [--boot]
 #   --service  register a termux-services (runit) service "seccore" (sv up/down seccore)
 #   --boot     start seccore at device boot (needs the Termux:Boot app, opened once)
-# For an encrypted identity, the service/boot script reads the passphrase from
-# ~/.seccore/passphrase (mode 600) if present. That's a trade-off: the file can be read by anyone with access to the device.
+# Encrypted identity at boot: run `seccore keystore-setup` once (Android Keystore wraps the passphrase,
+# needs the Termux:API app). Otherwise the daemon starts LOCKED and waits for `seccore unlock`.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SERVICE=0; BOOT=0
@@ -12,7 +12,8 @@ for a in "$@"; do case "$a" in --service) SERVICE=1;; --boot) BOOT=1;; *) echo "
 
 if [ -z "${PREFIX:-}" ] || [ ! -d "$PREFIX" ]; then echo "this script is for Termux"; exit 1; fi
 pkg update -y
-pkg install -y nodejs-lts git libqrencode termux-services termux-api || pkg install -y nodejs git libqrencode termux-services
+pkg install -y nodejs-lts git libqrencode termux-services termux-api util-linux || pkg install -y nodejs git libqrencode termux-services util-linux
+# optional, for task sandboxing:  pkg install proot
 
 cd "$REPO"
 npm ci --omit=dev --no-audit --no-fund
@@ -33,7 +34,6 @@ RUN="$HOME/.seccore/run-daemon.sh"
 cat > "$RUN" <<EOS
 #!/data/data/com.termux/files/usr/bin/sh
 termux-wake-lock 2>/dev/null || true
-[ -f "\$HOME/.seccore/passphrase" ] && export SECCORE_PASSPHRASE="\$(cat "\$HOME/.seccore/passphrase")"
 exec node "$REPO/cli.mjs" daemon
 EOS
 chmod 700 "$RUN"
