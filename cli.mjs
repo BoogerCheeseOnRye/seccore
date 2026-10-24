@@ -11,6 +11,7 @@ import { MeshNode, startControl, ensureToken, loadMeshConfig } from './mesh.mjs'
 import { TaskRunner, loadTasks, taskHandler } from './tasks.mjs';
 import * as secrets from './secrets.mjs';
 import * as keystore from './keystore.mjs';
+import { AuditLog, verifyAudit, auditKey } from './audit.mjs';
 import { makeBundle, parseBundle, pairingCode } from './pair.mjs';
 import { spawnSync } from 'node:child_process';
 
@@ -37,6 +38,7 @@ Mesh (config: DIR/mesh.json, control token: DIR/control.token):
   seccore tasks PEER | task PEER NAME [ARGS_JSON] [--wait] | job PEER ID [status|result|cancel] | jobs PEER
   seccore revoke NAME|FP|self [--reason R]   signed revocation, gossiped mesh-wide (permanent)
   seccore unlock | keystore-setup | keystore-remove   boot unlock (locked daemon / Android Keystore)
+  seccore audit-verify             check the task audit log hash chain + MAC
   seccore send TO JSON | broadcast JSON | request TO JSON [--timeout MS] | inbox | retrust NAME
 FP = the other device's fingerprint (compare out-of-band!). Pins saved in DIR/known_peers.json.`;
 
@@ -121,10 +123,11 @@ async function runNode(){
   }
   const custom = c.handler ? (await import(pathToFileURL(path.resolve(dir, c.handler)).href)).default : null;
   const tasksFile = path.join(dir, 'tasks.json');
-  const runner = fs.existsSync(tasksFile) ? new TaskRunner(loadTasks(tasksFile)) : null;
+  const ident = await identity();
+  const runner = fs.existsSync(tasksFile) ? new TaskRunner(loadTasks(tasksFile), { audit: new AuditLog(path.join(dir, 'audit.log'), { key: auditKey(ident) }) }) : null;
   const handler = taskHandler(runner, custom);
   const alertLog = path.join(dir, 'alerts.log');
-  const node = new MeshNode({ identity: await identity(), name: c.name, host: c.host || '127.0.0.1', port: c.port,
+  const node = new MeshNode({ identity: ident, name: c.name, host: c.host || '127.0.0.1', port: c.port,
     peers: c.peers, canarySecret: await canary(c), decoyPort: c.decoyPort, alertLog, handler,
     heartbeatMs: c.heartbeatMs, deadMs: c.deadMs, canaryMs: c.canaryMs, maxHops: c.maxHops, acceptRelayFrom: c.acceptRelayFrom, revocation: c.revocation, revokedFile: path.join(dir, 'revoked.json'), replayFile: path.join(dir, 'replay.json'), ...(c.limits || {}) });
   node.inbox = [];
@@ -199,6 +202,9 @@ if (cmd === 'mesh-init'){
   console.log('passphrase wrapped by Android Keystore -> ' + ksFile + ' (boot unlock is now automatic on this device)');
 } else if (cmd === 'keystore-remove'){
   secrets.shred(ksFile); console.log('removed ' + ksFile + '; unlock will need the passphrase again');
+} else if (cmd === 'audit-verify'){
+  const r = verifyAudit(path.join(dir, 'audit.log'), { key: auditKey(await identity()) });
+  console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1);
 } else if (cmd === 'retrust'){ await ctl('POST', '/retrust', { peer: pos[0] });
 } else if (cmd === 'encrypt-secrets'){
   // Migration: encrypt identity.pem and mesh.json canarySecret in place with one passphrase.
