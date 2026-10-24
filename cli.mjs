@@ -10,6 +10,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MeshNode, startControl, ensureToken, loadMeshConfig } from './mesh.mjs';
 import { TaskRunner, loadTasks, taskHandler } from './tasks.mjs';
 import * as secrets from './secrets.mjs';
+import { makeBundle, parseBundle, pairingCode } from './pair.mjs';
+import { spawnSync } from 'node:child_process';
 
 const [cmd, ...rest] = process.argv.slice(2);
 const a = {}, pos = [];
@@ -27,6 +29,7 @@ const usage = `usage:
 Mesh (config: DIR/mesh.json, control token: DIR/control.token):
   seccore mesh-init --name NAME [--host 0.0.0.0|LAN-IP] [--port 7400] [--control-port 7401]
   seccore add-peer --name NAME --fp FP [--host H --port P]
+  seccore pair [--host H] [--no-addr] | pair --import BUNDLE [--name N] [--yes]
   seccore node                     run the mesh node in the foreground
   seccore daemon                   run the node under an auto-restart supervisor
   seccore peers | status           query the local node
@@ -154,6 +157,32 @@ if (cmd === 'mesh-init'){
     if (c.canarySecret){ c.canarySecretEnc = secrets.seal(c.canarySecret, pass, undefined, 'seccore-canary'); delete c.canarySecret; saveMesh(c); console.log('mesh.json canarySecret encrypted'); }
   }
   console.log('Unlock at start with SECCORE_PASSPHRASE=... or the prompt. There is no recovery if you forget it.');
+} else if (cmd === 'pair'){
+  const c = loadMeshConfig(meshFile), me = sc.fingerprint((await identity()).raw);
+  if (!a.import){
+    const b = makeBundle({ name: c.name, fingerprint: me, host: a['no-addr'] ? null : (a.host || c.host), port: c.port });
+    console.log(b);
+    const q = spawnSync('qrencode', ['-t', 'ANSIUTF8', b], { stdio: ['ignore', 'pipe', 'ignore'] });
+    if (q.status === 0) process.stdout.write(q.stdout); else console.error('(install qrencode to show a QR code: pkg install libqrencode)');
+    console.error('On the other device: seccore pair --import <bundle>. Then compare the pairing code shown on both screens.');
+  } else {
+    const p = parseBundle(a.import);
+    if (p.fingerprint === me) { console.error('that is this device'); process.exit(1); }
+    const name = typeof a.name === 'string' ? a.name : p.name;
+    const code = pairingCode(me, p.fingerprint);
+    console.log('peer ' + name + '  fp ' + p.fingerprint + (p.host ? '  addr ' + p.host + ':' + p.port : '  (no address: it dials us or is reached via relay)'));
+    console.log('PAIRING CODE: ' + code + '   <- must match the code on the other device (after it imports yours)');
+    if (!a.yes){
+      if (!process.stdin.isTTY) { console.error('re-run with --yes after comparing the code'); process.exit(2); }
+      const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+      const ans = await new Promise((r) => rl.question('codes match? [y/N] ', r)); rl.close();
+      if (!/^y(es)?$/i.test(ans.trim())) { console.error('not paired'); process.exit(1); }
+    }
+    c.peers = c.peers.filter((x) => x.name !== name && x.fingerprint !== p.fingerprint);
+    c.peers.push({ name, fingerprint: p.fingerprint, ...(p.host ? { host: p.host, port: p.port } : {}) });
+    const raw = JSON.parse(fs.readFileSync(meshFile, 'utf8')); raw.peers = c.peers; saveMesh(raw);
+    console.log('paired with ' + name + '. Note: the canary secret is NOT in bundles. Share it separately, in person.');
+  }
 } else if (cmd === 'keygen'){
   const id = sc.generateIdentity();
   if (sc.identityIsEncrypted(dir) || fs.existsSync(path.join(dir, 'identity.pem'))) { console.error('identity already exists in ' + dir); process.exit(1); }
