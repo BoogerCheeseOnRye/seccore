@@ -12,7 +12,10 @@ import { ml_kem768 } from '@noble/post-quantum/ml-kem.js';
 import * as secrets from './secrets.mjs';
 
 export const VERSION = 'seccore-v1';
-const MAX_FRAME = 1 << 20;            // 1 MiB
+export const MAX_FRAME = 1 << 20;     // 1 MiB (post-handshake)
+const HS_MAX_FRAME = 16 * 1024;       // handshake messages are ~2-3 KiB
+const HS_MAX_QUEUE = 4;
+const KEM_EK_LEN = 1184, KEM_CT_LEN = 1088;
 const HS_TIMEOUT_MS = 10_000;
 export const DEFAULTS = { rekeyMessages: 1 << 20, rekeyBytes: 1 << 30 };
 const T_DATA = 1, T_REKEY = 2, T_CONFIRM = 3;
@@ -68,17 +71,19 @@ export class PinStore {
 }
 
 // ── framing ───────────────────────────────────────────────────────────────
-class FrameReader {
-  constructor(sock, onFrame, onError){
-    this.buf = Buffer.alloc(0);
+export class FrameReader {
+  constructor(sock, onFrame, onError, max = MAX_FRAME){
+    this.buf = Buffer.alloc(0); this.max = max; this.dead = false;
+    const die = (e) => { this.dead = true; this.buf = Buffer.alloc(0); onError(e); };
     sock.on('data', (d) => {
-      this.buf = Buffer.concat([this.buf, d]);
-      while (this.buf.length >= 4){
+      if (this.dead) return;
+      this.buf = this.buf.length ? Buffer.concat([this.buf, d]) : d;
+      while (!this.dead && this.buf.length >= 4){
         const len = this.buf.readUInt32BE(0);
-        if (len > MAX_FRAME || len === 0) return onError(new Error('bad frame length'));
+        if (len > this.max || len === 0) return die(new Error('bad frame length'));
         if (this.buf.length < 4 + len) break;
         const f = this.buf.subarray(4, 4 + len); this.buf = this.buf.subarray(4 + len);
-        try { onFrame(f); } catch (e) { return onError(e); }
+        try { onFrame(f); } catch (e) { return die(e); }
       }
     });
   }
@@ -121,6 +126,7 @@ export class SecureChannel extends EventEmitter {
     this.opts = { ...DEFAULTS, ...opts }; this.closed = false;
   }
   _start(reader){
+    reader.max = MAX_FRAME;
     reader.onFrame = (f) => {
       let r;
       try { r = this.rx.open(f); } catch (e) { return this.fail(e); }
@@ -135,11 +141,12 @@ export class SecureChannel extends EventEmitter {
   send(data){
     if (this.closed) throw new Error('channel closed');
     const pt = Buffer.from(data);
+    if (pt.length > MAX_FRAME - 64) throw new Error('message too large (' + pt.length + ' bytes)');
     this.sock.write(frame(this.tx.seal(T_DATA, pt)));
     if (this.tx.msgs >= this.opts.rekeyMessages || this.tx.bytes >= this.opts.rekeyBytes) this.rekey();
   }
   rekey(){ this.sock.write(frame(this.tx.seal(T_REKEY, Buffer.alloc(0)))); this.tx.rekey(); this.emit('rekey'); }
-  fail(err){ if (this.closed) return; this.closed = true; this.emit('error', err); this.sock.destroy(); }
+  fail(err){ if (this.closed) return; this.closed = true; if (this.listenerCount('error')) this.emit('error', err); this.sock.destroy(); }
   close(){ this.closed = true; this.sock.end(); }
 }
 
@@ -152,8 +159,9 @@ function hsReader(sock){
   const q = []; let waiter = null; let err = null;
   const reader = new FrameReader(sock, (f) => {
     if (reader.onFrame) return reader.onFrame(f);
+    if (q.length >= HS_MAX_QUEUE) throw new Error('too many frames during handshake');
     q.push(f); if (waiter){ const w = waiter; waiter = null; w(); }
-  }, (e) => { err = e; sock.destroy(); if (waiter){ const w = waiter; waiter = null; w(); } });
+  }, (e) => { err = e; sock.destroy(); if (waiter){ const w = waiter; waiter = null; w(); } }, HS_MAX_FRAME);
   sock.on('close', () => { err ??= new Error('connection closed during handshake'); if (waiter){ const w = waiter; waiter = null; w(); } });
   reader.q = q;
   reader.next = async () => {
@@ -203,7 +211,8 @@ export async function clientHandshake(sock, identity, opts = {}){
     if (!crypto.verify(null, Buffer.concat([Buffer.from(VERSION + ' server'), th2]), edPubFromRaw(idR), unb64(m2.sig))) throw new Error('server signature invalid');
     checkPin(idR, opts);
     const xss = x25519Shared(ex.kp.privateKey, unb64(m2.ex));
-    const kss = ml_kem768.decapsulate(unb64(m2.ct), kem.secretKey);
+    const kct = unb64(m2.ct); if (kct.length !== KEM_CT_LEN) throw new Error('bad ML-KEM ciphertext');
+    const kss = ml_kem768.decapsulate(kct, kem.secretKey);
     const th3 = sha256(m1, m2f, identity.raw);
     const sig = crypto.sign(null, Buffer.concat([Buffer.from(VERSION + ' client'), th3]), identity.privateKey);
     sock.write(enc({ id: b64(identity.raw), sig: b64(sig) }));
@@ -224,7 +233,8 @@ export async function serverHandshake(sock, identity, opts = {}){
     if (o1.v !== VERSION) throw new Error('version mismatch');
     const ex = x25519();
     const xss = x25519Shared(ex.kp.privateKey, unb64(o1.ex));
-    const { cipherText, sharedSecret } = ml_kem768.encapsulate(unb64(o1.ek));
+    const ek = unb64(o1.ek); if (ek.length !== KEM_EK_LEN) throw new Error('bad ML-KEM key');
+    const { cipherText, sharedSecret } = ml_kem768.encapsulate(ek);
     const body = { ex: b64(ex.raw), ct: b64(cipherText), id: b64(identity.raw), n: b64(crypto.randomBytes(32)) };
     const th2 = sha256(m1, Buffer.from(JSON.stringify(body)));
     const sig = crypto.sign(null, Buffer.concat([Buffer.from(VERSION + ' server'), th2]), identity.privateKey);
@@ -244,18 +254,23 @@ export async function serverHandshake(sock, identity, opts = {}){
 }
 
 export function listen({ host = '127.0.0.1', port, identity, ...opts }, onChannel, onError = () => {}){
-  const { gate, ...hsOpts } = opts;
+  const { gate, maxPending = 64, ...hsOpts } = opts;
+  let pending = 0;
   const srv = net.createServer((sock) => {
-    // Optional pre-handshake gate (e.g. per-IP rate limit) so floods never reach the crypto.
-    if (gate && !gate(sock)){ sock.destroy(); return; }
-    serverHandshake(sock, identity, hsOpts).then(onChannel, onError);
+    // Optional pre-handshake gate (e.g. per-IP rate limit) so floods never reach the crypto,
+    // plus a global cap on concurrent unauthenticated handshakes.
+    if ((gate && !gate(sock)) || pending >= maxPending){ sock.destroy(); return; }
+    sock.on('error', () => {});
+    pending++;
+    serverHandshake(sock, identity, hsOpts).finally(() => { pending--; }).then(onChannel, onError);
   });
   srv.listen(port, host);
   return srv;
 }
 export function connect({ host = '127.0.0.1', port, identity, ...opts }){
   return new Promise((res, rej) => {
-    const sock = net.connect(port, host, () => clientHandshake(sock, identity, opts).then(res, rej));
+    const sock = net.connect(port, host, () => { sock.setTimeout(0); clientHandshake(sock, identity, opts).then(res, rej); });
+    sock.setTimeout(10_000, () => { sock.destroy(); rej(new Error('connect timeout')); });
     sock.once('error', rej);
   });
 }

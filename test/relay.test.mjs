@@ -126,3 +126,14 @@ test('one-sided adjacency claims do not create routes', () => {
   recs.set(y.fp, e2e.verifyRecord(e2e.makeRecord(y.id, { seq: 2, prekey: y.pk.publicInfo(), nbrs: [x.fp] })));
   assert.equal(e2e.nextHop(me.fp, [x.fp], recs, y.fp), x.fp);
 });
+
+test('envelope with non-numeric timestamp is rejected (stale-check bypass regression)', async () => {
+  const { n, stop } = await topo(['a', 'b', 'c'], [['a', 'b'], ['b', 'c']], [['a', 'c']]);
+  const got = []; n.c.on('message', (m) => got.push(m));
+  const id = 'e'.repeat(32);
+  const sealed = e2e.seal({ identity: n.a.id, dstFp: n.c.fp, prekey: n.a.directory.get(n.c.fp).pk, body: { k: 'msg', body: 'old' }, id, ts: 'not-a-number' });
+  n.c._onRelay('b', { t: 'relay', id, dst: n.c.fp, ttl: 3, path: [n.a.fp, n.b.fp], sealed });
+  assert.equal(got.length, 0);
+  assert.ok(n.c.alerts.some((x) => x.kind === 'relay-stale'));
+  await stop();
+});

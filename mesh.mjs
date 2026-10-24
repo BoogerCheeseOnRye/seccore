@@ -42,6 +42,7 @@ export class MeshNode extends EventEmitter {
     for (const p of opts.peers || []) this.addPeer(p, false);
     // Per-peer message/request budget and per-IP handshake budget.
     this.msgLimit = new KeyedLimiter(this.o.peerRate ?? 50, this.o.peerBurst ?? 100);
+    this.ctrlLimit = new KeyedLimiter(this.o.ctrlRate ?? 20, this.o.ctrlBurst ?? 200);
     this.hsLimit = new KeyedLimiter(this.o.handshakeRate ?? 2, this.o.handshakeBurst ?? 10);
     // Relay state: rotating prekeys (memory only), signed node records, dedupe set.
     this.prekeys = new e2e.PrekeyStore({ rotateMs: this.o.prekeyRotateMs ?? 3600_000, keep: this.o.prekeyKeep ?? 2 });
@@ -152,7 +153,13 @@ export class MeshNode extends EventEmitter {
     if (!st) throw new Error('unknown peer ' + name);
     if (!st.trusted) throw new Error('peer ' + name + ' is untrusted');
     if (!st.ch || st.ch.closed) throw new Error('peer ' + name + ' not connected');
-    st.ch.send(JSON.stringify(obj));
+    let data = JSON.stringify(obj);
+    // An oversized frame would make the receiver drop the whole link; send an error result instead.
+    if (Buffer.byteLength(data) > sc.MAX_FRAME - 1024){
+      if (obj.t === 'res') data = JSON.stringify({ t: 'res', id: obj.id, ok: false, error: 'result too large for one frame; fetch less output (lower maxOutput)' });
+      else throw new Error('message too large');
+    }
+    st.ch.send(data);
   }
 
   async _onMessage(name, ch, raw){
@@ -160,7 +167,11 @@ export class MeshNode extends EventEmitter {
     let m; try { m = JSON.parse(raw.toString('utf8')); } catch { return this._alert('malformed', name, 'non-JSON frame'); }
     if (!m || typeof m !== 'object') return;
     // `from` is always the authenticated channel identity, never a field the peer wrote.
-    if ((m.t === 'msg' || m.t === 'req' || m.t === 'relay') && !this.msgLimit.take(name)){
+    // Data (msg/req/relay) and control (gossip, canary, …) have separate budgets; gossip batches
+    // cost per item because each item is a signature check. Heartbeats are free.
+    const data = m.t === 'msg' || m.t === 'req' || m.t === 'relay';
+    const cost = m.t === 'hb' || m.t === 'hbAck' ? 0 : 1 + Math.floor(((Array.isArray(m.recs) ? m.recs.length : 0) + (Array.isArray(m.notices) ? m.notices.length : 0)) / 8);
+    if (cost && !(data ? this.msgLimit : this.ctrlLimit).take(name, cost)){
       this._rlAlert('peer-rate', name, name);
       if (m.t === 'req') this._safeWrite(name, { t: 'res', id: m.id, ok: false, error: 'rate limited' });
       return;
@@ -290,7 +301,13 @@ export class MeshNode extends EventEmitter {
       if (v.seq > Date.now() + 600_000) continue;                         // refuse far-future seq (would freeze updates)
       const cur = this.directory.get(v.fp);
       if (cur && cur.seq >= v.seq) continue;
-      if (!cur && this.directory.size >= (this.o.maxDirectory ?? 1000)) continue;
+      if (!cur && this.directory.size >= (this.o.maxDirectory ?? 1000)){
+        // Full: configured peers always get a slot (evict an unconfigured entry) so junk can't crowd them out.
+        if (!this.byFp.has(v.fp)) continue;
+        const victim = [...this.directory.keys()].find((f) => !this.byFp.has(f));
+        if (!victim) continue;
+        this.directory.delete(victim);
+      }
       this.directory.set(v.fp, v); fresh.push(rec);
     }
     if (fresh.length) for (const [n, st] of this.peers) if (n !== from && st.ch && st.trusted) this._safeWrite(n, { t: 'rec', recs: fresh });
@@ -321,17 +338,17 @@ export class MeshNode extends EventEmitter {
     return n;
   }
   _onRelay(from, m){
-    if (typeof m.id !== 'string' || !/^[0-9a-f]{32}$/.test(m.id) || typeof m.dst !== 'string' || !Number.isInteger(m.ttl) || !Array.isArray(m.path) || m.path.length > 32 || !m.sealed) return this._alert('bad-relay', from, 'malformed relay frame');
+    if (typeof m.id !== 'string' || !/^[0-9a-f]{32}$/.test(m.id) || typeof m.dst !== 'string' || !Number.isInteger(m.ttl) || !Array.isArray(m.path) || m.path.length > 32 || !m.path.every((x) => typeof x === 'string') || !m.sealed || typeof m.sealed !== 'object') return this._alert('bad-relay', from, 'malformed relay frame');
     if (!this._markSeen(m.id)) return;                                   // dedupe
     if (m.dst !== this.fp){
       if (m.path.includes(this.fp)) return;                              // loop
       if (m.ttl <= 1) return this.emit('relay-dropped', m.id, 'ttl');    // hop limit
-      return this._forward({ ...m, ttl: m.ttl - 1, path: [...m.path, this.fp] }, from);
+      return this._forward({ ...m, ttl: Math.min(m.ttl, this.o.maxHops ?? 8) - 1, path: [...m.path, this.fp] }, from);
     }
     let env;
     try { env = e2e.open(m.sealed, this.id, this.prekeys); } catch (e) { return this._alert('relay-open-failed', from, e.message); }
     if (env.id !== m.id) return this._alert('relay-open-failed', from, 'outer/inner id mismatch');
-    if (Math.abs(Date.now() - env.ts) > (this.o.relayMaxAgeMs ?? 300_000)) return this._alert('relay-stale', from, 'envelope too old/new');
+    if (!Number.isFinite(env.ts) || Math.abs(Date.now() - env.ts) > (this.o.relayMaxAgeMs ?? 300_000)) return this._alert('relay-stale', from, 'envelope too old/new');
     if (this.isRevoked(env.src)) return this._alert('relay-revoked-sender', from, 'dropped e2e message from revoked ' + env.src);
     const srcName = this.byFp.get(env.src);
     const acc = this.o.acceptRelayFrom || [];
@@ -449,7 +466,7 @@ export function startControl(node, { port = 0, token }){
         if (req.method === 'GET' && u.pathname === '/peers') return reply(res, 200, { ok: true, peers: node.status().peers });
         if (req.method === 'POST' && u.pathname === '/send'){ node.send(b.to, b.body); return reply(res, 200, { ok: true }); }
         if (req.method === 'POST' && u.pathname === '/broadcast') return reply(res, 200, { ok: true, sent: node.broadcast(b.body) });
-        if (req.method === 'POST' && u.pathname === '/request') return reply(res, 200, { ok: true, result: await node.request(b.to, b.body, b.timeoutMs) });
+        if (req.method === 'POST' && u.pathname === '/request') return reply(res, 200, { ok: true, result: await node.request(b.to, b.body, Number.isFinite(b.timeoutMs) ? Math.min(Math.max(b.timeoutMs, 100), 3_600_000) : undefined) });
         if (req.method === 'POST' && u.pathname === '/revoke'){ const t = b.target === 'self' ? 'self' : (node.peers.get(b.target)?.cfg.fingerprint ?? b.target); const r = node.revoke(t, b.reason); return reply(res, 200, { ok: r.status !== 'invalid', status: r.status, signers: r.notice?.sigs?.length }); }
         if (req.method === 'POST' && u.pathname === '/retrust') return reply(res, 200, { ok: node.retrust(b.peer) });
         if (req.method === 'GET' && u.pathname === '/inbox'){ const m = node.inbox?.splice(0) ?? []; return reply(res, 200, { ok: true, messages: m }); }
