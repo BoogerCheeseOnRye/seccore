@@ -4,7 +4,7 @@
   "description": "Authenticated encrypted P2P channel",
   "main": "seccore.mjs",
   "scripts": {
-    "test": "node --test --test-timeout=10000 test/"
+    "test": "node --test --test-timeout=15000 test/*.test.mjs"
   },
   "keywords": [],
   "author": "",

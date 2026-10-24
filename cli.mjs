@@ -10,6 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MeshNode, startControl, ensureToken, loadMeshConfig } from './mesh.mjs';
 import { TaskRunner, loadTasks, taskHandler } from './tasks.mjs';
 import * as secrets from './secrets.mjs';
+import * as keystore from './keystore.mjs';
 import { makeBundle, parseBundle, pairingCode } from './pair.mjs';
 import { spawnSync } from 'node:child_process';
 
@@ -35,6 +36,7 @@ Mesh (config: DIR/mesh.json, control token: DIR/control.token):
   seccore peers | status           query the local node
   seccore tasks PEER | task PEER NAME [ARGS_JSON] [--wait] | job PEER ID [status|result|cancel] | jobs PEER
   seccore revoke NAME|FP|self [--reason R]   signed revocation, gossiped mesh-wide (permanent)
+  seccore unlock | keystore-setup | keystore-remove   boot unlock (locked daemon / Android Keystore)
   seccore send TO JSON | broadcast JSON | request TO JSON [--timeout MS] | inbox | retrust NAME
 FP = the other device's fingerprint (compare out-of-band!). Pins saved in DIR/known_peers.json.`;
 
@@ -52,17 +54,51 @@ function chat(ch){
   process.stdin.on('end', () => ch.close());
 }
 
+// Passphrase sources, in order: cached → $SECCORE_PASSPHRASE → Android Keystore wrap → TTY prompt.
+let cachedPass = null;
+const ksFile = path.join(dir, 'passphrase.ks');
+async function passphrase(prompt, { interactive = true } = {}){
+  if (cachedPass) return cachedPass;
+  if (process.env.SECCORE_PASSPHRASE) return (cachedPass = process.env.SECCORE_PASSPHRASE);
+  if (fs.existsSync(ksFile)){ try { return (cachedPass = keystore.unwrap(ksFile)); } catch (e) { console.error('keystore unlock failed: ' + e.message); } }
+  if (!interactive) return null;
+  const p = await secrets.getPassphrase(prompt);
+  if (p) cachedPass = p;
+  return p;
+}
 async function identity(){
-  if (sc.identityIsEncrypted(dir)){
-    const p = await secrets.getPassphrase('unlock identity (' + dir + '): ');
-    return sc.loadIdentity(dir, p);
-  }
+  if (sc.identityIsEncrypted(dir)) return sc.loadIdentity(dir, await passphrase('unlock identity (' + dir + '): '));
   return sc.loadIdentity(dir);
 }
-let cachedPass = null;
 async function canary(c){
-  if (c.canarySecretEnc){ cachedPass ??= process.env.SECCORE_PASSPHRASE || await secrets.getPassphrase('unlock canary secret: '); return secrets.open(c.canarySecretEnc, cachedPass).toString(); }
+  if (c.canarySecretEnc) return secrets.open(c.canarySecretEnc, await passphrase('unlock canary secret: ')).toString();
   return c.canarySecret;
+}
+// Locked mode: no passphrase source at boot. Serve only /unlock and /status on the control port until
+// `seccore unlock` delivers the passphrase (token-authenticated, loopback only).
+async function waitForUnlock(c, tryPass){
+  const token = ensureToken(tokenFile);
+  const http = await import('node:http');
+  console.log(new Date().toISOString(), 'LOCKED: run `seccore unlock` to start the node');
+  return new Promise((resolve) => {
+    const srv = http.createServer((req, res) => {
+      const reply = (code, o) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
+      const auth = String(req.headers.authorization || '');
+      const ok = auth.length === 7 + token.length && crypto.timingSafeEqual(Buffer.from(auth), Buffer.from('Bearer ' + token));
+      if (!ok) return reply(401, { ok: false, error: 'missing or bad token' });
+      if (req.headers.origin) return reply(403, { ok: false, error: 'browser origin refused' });
+      if (req.method === 'GET' && req.url === '/status') return reply(200, { ok: true, locked: true, name: c.name });
+      if (req.method !== 'POST' || req.url !== '/unlock') return reply(423, { ok: false, error: 'node is locked; run seccore unlock' });
+      let body = ''; req.on('data', (d) => { body += d; if (body.length > 4096) req.destroy(); });
+      req.on('end', () => {
+        let p; try { p = JSON.parse(body).passphrase; } catch { return reply(400, { ok: false, error: 'bad json' }); }
+        if (typeof p !== 'string' || !tryPass(p)) return reply(403, { ok: false, error: 'wrong passphrase' });
+        reply(200, { ok: true, unlocked: true });
+        srv.close(); srv.closeAllConnections?.(); cachedPass = p; resolve(p);
+      });
+    });
+    srv.listen(c.controlPort ?? 7401, '127.0.0.1');
+  });
 }
 const meshFile = path.join(dir, 'mesh.json');
 const tokenFile = path.join(dir, 'control.token');
@@ -78,6 +114,11 @@ async function ctl(method, p, body){
 }
 async function runNode(){
   const c = loadMeshConfig(meshFile);
+  if (sc.identityIsEncrypted(dir) || c.canarySecretEnc){
+    const p = await passphrase('unlock seccore: ', { interactive: !!process.stdin.isTTY && !a.locked });
+    const tryPass = (x) => { try { if (sc.identityIsEncrypted(dir)) sc.loadIdentity(dir, x); if (c.canarySecretEnc) secrets.open(c.canarySecretEnc, x); return true; } catch { return false; } };
+    if (!p || !tryPass(p)){ cachedPass = null; await waitForUnlock(c, tryPass); await new Promise((r) => setTimeout(r, 100)); }
+  }
   const custom = c.handler ? (await import(pathToFileURL(path.resolve(dir, c.handler)).href)).default : null;
   const tasksFile = path.join(dir, 'tasks.json');
   const runner = fs.existsSync(tasksFile) ? new TaskRunner(loadTasks(tasksFile)) : null;
@@ -144,6 +185,20 @@ if (cmd === 'mesh-init'){
 } else if (cmd === 'revoke'){
   if (!pos[0]) { console.error('usage: seccore revoke PEER_NAME|FINGERPRINT|self [--reason TEXT]'); process.exit(2); }
   await ctl('POST', '/revoke', { target: pos[0], reason: typeof a.reason === 'string' ? a.reason : '' });
+} else if (cmd === 'unlock'){
+  const p = await secrets.getPassphrase('passphrase: ');
+  if (!p) { console.error('need a TTY or SECCORE_PASSPHRASE'); process.exit(2); }
+  await ctl('POST', '/unlock', { passphrase: p });
+} else if (cmd === 'keystore-setup'){
+  if (!keystore.available()) { console.error('termux-keystore not available (pkg install termux-api + the Termux:API app)'); process.exit(1); }
+  const p = await secrets.getPassphrase('current passphrase: ');
+  const c = fs.existsSync(meshFile) ? loadMeshConfig(meshFile) : {};
+  try { if (sc.identityIsEncrypted(dir)) sc.loadIdentity(dir, p); if (c.canarySecretEnc) secrets.open(c.canarySecretEnc, p); } catch { console.error('wrong passphrase'); process.exit(1); }
+  keystore.wrap(p, ksFile);
+  if (keystore.unwrap(ksFile) !== p) throw new Error('verify failed');
+  console.log('passphrase wrapped by Android Keystore -> ' + ksFile + ' (boot unlock is now automatic on this device)');
+} else if (cmd === 'keystore-remove'){
+  secrets.shred(ksFile); console.log('removed ' + ksFile + '; unlock will need the passphrase again');
 } else if (cmd === 'retrust'){ await ctl('POST', '/retrust', { peer: pos[0] });
 } else if (cmd === 'encrypt-secrets'){
   // Migration: encrypt identity.pem and mesh.json canarySecret in place with one passphrase.
