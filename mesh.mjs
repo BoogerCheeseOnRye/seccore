@@ -10,6 +10,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import * as sc from './seccore.mjs';
 import { KeyedLimiter } from './ratelimit.mjs';
+import * as e2e from './e2e.mjs';
 
 const MAX_CTL_BODY = 256 * 1024;
 const safeEq = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
@@ -40,6 +41,11 @@ export class MeshNode extends EventEmitter {
     // Per-peer message/request budget and per-IP handshake budget.
     this.msgLimit = new KeyedLimiter(this.o.peerRate ?? 50, this.o.peerBurst ?? 100);
     this.hsLimit = new KeyedLimiter(this.o.handshakeRate ?? 2, this.o.handshakeBurst ?? 10);
+    // Relay state: box key + signed announcement, directory of verified box keys, dedupe set.
+    this.box = e2e.boxKeyFromIdentity(this.id);
+    this.ann = e2e.makeAnnouncement(this.id, this.box);
+    this.directory = new Map();                   // fp -> { x, ed }
+    this.seen = new Map();                        // relay id -> ts
     this.pending = new Map();                     // request id -> {resolve,reject,timer}
     this.alerts = [];
     this.stopped = false;
@@ -127,6 +133,7 @@ export class MeshNode extends EventEmitter {
       this._scheduleDial(name);
     });
     this.emit('peer-up', name, dir);
+    this._safeWrite(name, { t: 'ann', anns: [this.ann, ...[...this.directory.values()].map((d) => d.ann)] });
     if (this.o.canarySecret) this._canary(name);
   }
 
@@ -153,6 +160,8 @@ export class MeshNode extends EventEmitter {
       case 'hbAck': if (typeof m.ts === 'number') st.rtt = Date.now() - m.ts; return;
       case 'canary': return this._safeWrite(name, { t: 'canaryRes', c: m.c, mac: this._canaryMac(m.c, st.cfg.fingerprint, this.fp) });
       case 'canaryRes': return this._checkCanary(name, m);
+      case 'ann': return this._onAnn(name, m);
+      case 'relay': return this._onRelay(name, m);
       case 'msg': if (st.trusted) this.emit('message', { from: name, body: m.body }); return;
       case 'req': {
         if (!st.trusted) return;
@@ -165,7 +174,7 @@ export class MeshNode extends EventEmitter {
       }
       case 'res': {
         const p = this.pending.get(m.id);
-        if (!p || p.peer !== name) return;          // only the peer we asked can answer
+        if (!p || p.peer !== name || p.viaRelay) return;   // only the peer we asked can answer
         this.pending.delete(m.id); clearTimeout(p.timer);
         return m.ok ? p.resolve(m.result) : p.reject(new Error(m.error || 'remote error'));
       }
@@ -175,18 +184,37 @@ export class MeshNode extends EventEmitter {
   _safeWrite(name, obj){ try { this._write(name, obj); } catch {} }
 
   // ── public API ──────────────────────────────────────────────────────────
-  send(to, body){ this._write(to, { t: 'msg', body }); }
+  // `to` = configured peer name or a fingerprint. Uses the direct link when up, else relays end-to-end sealed.
+  _resolve(to){
+    const n = this.peers.has(to) ? to : this.byFp.get(to);
+    if (n && !this.peers.get(n).trusted) throw new Error('peer ' + n + ' is untrusted');
+    if (this.peers.has(to)) return { name: to, fp: this.peers.get(to).cfg.fingerprint };
+    if (this.byFp.has(to)) return { name: this.byFp.get(to), fp: to };
+    if (/^[0-9a-f]{4}(:[0-9a-f]{4}){9}$/.test(to)) return { name: null, fp: to };
+    throw new Error('unknown peer ' + to);
+  }
+  _direct(r){ const st = r.name && this.peers.get(r.name); return !!(st && st.ch && !st.ch.closed && st.trusted); }
+  send(to, body){
+    const r = this._resolve(to);
+    if (this._direct(r)) return this._write(r.name, { t: 'msg', body });
+    this._relaySend(r.fp, { k: 'msg', body });
+  }
   broadcast(body){
     const sent = [];
     for (const [n, st] of this.peers) if (st.ch && st.trusted){ try { this._write(n, { t: 'msg', body }); sent.push(n); } catch {} }
+    // Pinned peers that aren't directly connected but are reachable via relay.
+    if (this.o.broadcastRelay !== false) for (const [n, st] of this.peers) if (!st.ch && st.trusted && this.directory.has(st.cfg.fingerprint)){ try { this._relaySend(st.cfg.fingerprint, { k: 'msg', body }); sent.push(n + ' (relay)'); } catch {} }
     return sent;
   }
   request(to, body, timeoutMs = this.o.requestTimeoutMs){
     return new Promise((resolve, reject) => {
       const id = crypto.randomBytes(12).toString('hex');
       const timer = setTimeout(() => { this.pending.delete(id); reject(new Error('request timeout')); }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer, peer: to });
-      try { this._write(to, { t: 'req', id, body }); } catch (e) { clearTimeout(timer); this.pending.delete(id); reject(e); }
+      try {
+        const r = this._resolve(to);
+        if (this._direct(r)){ this.pending.set(id, { resolve, reject, timer, peer: r.name }); this._write(r.name, { t: 'req', id, body }); }
+        else { this.pending.set(id, { resolve, reject, timer, peerFp: r.fp, viaRelay: true }); this._relaySend(r.fp, { k: 'req', rid: id, body }); }
+      } catch (e) { clearTimeout(timer); this.pending.delete(id); reject(e); }
     });
   }
   status(){
@@ -203,6 +231,81 @@ export class MeshNode extends EventEmitter {
   }
   // Operator action after investigating: re-trust a peer that was flagged.
   retrust(name){ const st = this.peers.get(name); if (!st) return false; st.trusted = true; st.strikes = 0; this._scheduleDial(name); return true; }
+
+  // ── multi-hop relay ─────────────────────────────────────────────────────
+  _onAnn(from, m){
+    if (!Array.isArray(m.anns)) return;
+    const fresh = [];
+    for (const ann of m.anns.slice(0, 256)){
+      let v; try { v = e2e.verifyAnnouncement(ann); } catch { this._alert('bad-announcement', from, 'invalid signed box key'); continue; }
+      if (v.fp === this.fp) continue;
+      const cur = this.directory.get(v.fp);
+      if (cur && cur.x.equals(v.x)) continue;
+      if (!cur && this.directory.size >= (this.o.maxDirectory ?? 1000)) continue;
+      this.directory.set(v.fp, { x: v.x, ed: v.ed, ann }); fresh.push(ann);
+    }
+    if (fresh.length) for (const [n, st] of this.peers) if (n !== from && st.ch && st.trusted) this._safeWrite(n, { t: 'ann', anns: fresh });
+  }
+  _markSeen(id){
+    const now = Date.now();
+    if (this.seen.size > 20_000) for (const [k, t] of this.seen){ if (now - t > 600_000 || this.seen.size > 15_000) this.seen.delete(k); else break; }
+    if (this.seen.has(id)) return false;
+    this.seen.set(id, now); return true;
+  }
+  _relaySend(dstFp, inner){
+    const d = this.directory.get(dstFp);
+    if (!d) throw new Error('no route/key for ' + dstFp + ' (not yet announced in the mesh)');
+    const id = crypto.randomBytes(16).toString('hex');
+    const sealed = e2e.seal({ identity: this.id, dstFp, dstX: d.x, body: inner, id });
+    this._markSeen(id);
+    const n = this._forward({ t: 'relay', id, dst: dstFp, ttl: this.o.maxHops ?? 8, path: [this.fp], sealed }, null);
+    if (!n) throw new Error('no connected peers to relay through');
+  }
+  // Flood to trusted neighbours not already on the path; straight to the destination if it is a neighbour.
+  _forward(frame, from){
+    const dstName = this.byFp.get(frame.dst);
+    if (dstName && this._direct({ name: dstName })){ this._safeWrite(dstName, frame); return 1; }
+    let n = 0;
+    for (const [name, st] of this.peers){
+      if (name === from || !st.ch || !st.trusted || frame.path.includes(st.cfg.fingerprint)) continue;
+      this._safeWrite(name, frame); n++;
+    }
+    return n;
+  }
+  _onRelay(from, m){
+    if (typeof m.id !== 'string' || !/^[0-9a-f]{32}$/.test(m.id) || typeof m.dst !== 'string' || !Number.isInteger(m.ttl) || !Array.isArray(m.path) || m.path.length > 32 || !m.sealed) return this._alert('bad-relay', from, 'malformed relay frame');
+    if (!this._markSeen(m.id)) return;                                   // dedupe
+    if (m.dst !== this.fp){
+      if (m.path.includes(this.fp)) return;                              // loop
+      if (m.ttl <= 1) return this.emit('relay-dropped', m.id, 'ttl');    // hop limit
+      return this._forward({ ...m, ttl: m.ttl - 1, path: [...m.path, this.fp] }, from);
+    }
+    let env;
+    try { env = e2e.open(m.sealed, this.id, this.box); } catch (e) { return this._alert('relay-open-failed', from, e.message); }
+    if (env.id !== m.id) return this._alert('relay-open-failed', from, 'outer/inner id mismatch');
+    if (Math.abs(Date.now() - env.ts) > (this.o.relayMaxAgeMs ?? 300_000)) return this._alert('relay-stale', from, 'envelope too old/new');
+    const srcName = this.byFp.get(env.src);
+    const acc = this.o.acceptRelayFrom || [];
+    const ok = (srcName && this.peers.get(srcName).trusted) || acc.includes('*') || acc.includes(env.src);
+    if (!ok) return this._alert('relay-unknown-sender', from, 'dropped e2e message from unpaired ' + env.src);
+    const who = srcName || env.src, b = env.body || {};
+    if (b.k === 'msg') return this.emit('message', { from: who, fromFp: env.src, via: from, body: b.body });
+    if (b.k === 'req'){
+      (async () => {
+        let res;
+        try { if (!this.o.handler) throw new Error('no handler on ' + this.name); res = { k: 'res', rid: b.rid, ok: true, result: await this.o.handler(b.body, who) }; }
+        catch (e) { res = { k: 'res', rid: b.rid, ok: false, error: String(e?.message || e) }; }
+        try { this._relaySend(env.src, res); } catch (e) { this.emit('relay-dropped', b.rid, e.message); }
+      })();
+      return;
+    }
+    if (b.k === 'res'){
+      const p = this.pending.get(b.rid);
+      if (!p || !p.viaRelay || p.peerFp !== env.src) return;
+      this.pending.delete(b.rid); clearTimeout(p.timer);
+      return b.ok ? p.resolve(b.result) : p.reject(new Error(b.error || 'remote error'));
+    }
+  }
 
   // ── liveness ────────────────────────────────────────────────────────────
   _tick(){
