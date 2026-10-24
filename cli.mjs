@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MeshNode, startControl, ensureToken, loadMeshConfig } from './mesh.mjs';
+import { TaskRunner, loadTasks, taskHandler } from './tasks.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
 const a = {}, pos = [];
@@ -27,6 +28,7 @@ Mesh (config: DIR/mesh.json, control token: DIR/control.token):
   seccore node                     run the mesh node in the foreground
   seccore daemon                   run the node under an auto-restart supervisor
   seccore peers | status           query the local node
+  seccore tasks PEER | task PEER NAME [ARGS_JSON] [--wait] | job PEER ID [status|result|cancel] | jobs PEER
   seccore send TO JSON | broadcast JSON | request TO JSON [--timeout MS] | inbox | retrust NAME
 FP = the other device's fingerprint (compare out-of-band!). Pins saved in DIR/known_peers.json.`;
 
@@ -58,12 +60,10 @@ async function ctl(method, p, body){
 }
 async function runNode(){
   const c = loadMeshConfig(meshFile);
-  let handler = async (body) => {
-    if (body?.op === 'ping') return { pong: Date.now() };
-    if (body?.op === 'echo') return body;
-    throw new Error('no handler configured for this request (set "handler" in mesh.json)');
-  };
-  if (c.handler) handler = (await import(pathToFileURL(path.resolve(dir, c.handler)).href)).default;
+  const custom = c.handler ? (await import(pathToFileURL(path.resolve(dir, c.handler)).href)).default : null;
+  const tasksFile = path.join(dir, 'tasks.json');
+  const runner = fs.existsSync(tasksFile) ? new TaskRunner(loadTasks(tasksFile)) : null;
+  const handler = taskHandler(runner, custom);
   const alertLog = path.join(dir, 'alerts.log');
   const node = new MeshNode({ identity: sc.loadIdentity(dir), name: c.name, host: c.host || '127.0.0.1', port: c.port,
     peers: c.peers, canarySecret: c.canarySecret, decoyPort: c.decoyPort, alertLog, handler,
@@ -119,6 +119,10 @@ if (cmd === 'mesh-init'){
 } else if (cmd === 'send'){ await ctl('POST', '/send', { to: pos[0], body: parseJson(pos[1]) });
 } else if (cmd === 'broadcast'){ await ctl('POST', '/broadcast', { body: parseJson(pos[0]) });
 } else if (cmd === 'request'){ await ctl('POST', '/request', { to: pos[0], body: parseJson(pos[1]), timeoutMs: a.timeout ? Number(a.timeout) : undefined });
+} else if (cmd === 'tasks'){ await ctl('POST', '/request', { to: pos[0], body: { op: 'task.list' } });
+} else if (cmd === 'task'){ await ctl('POST', '/request', { to: pos[0], body: { op: a.wait ? 'task.run' : 'task.submit', task: pos[1], args: pos[2] ? JSON.parse(pos[2]) : {} }, timeoutMs: a.wait ? Number(a.timeout || 900000) : undefined });
+} else if (cmd === 'job'){ await ctl('POST', '/request', { to: pos[0], body: { op: 'task.' + (pos[2] || 'result'), id: pos[1] } });
+} else if (cmd === 'jobs'){ await ctl('POST', '/request', { to: pos[0], body: { op: 'task.jobs' } });
 } else if (cmd === 'retrust'){ await ctl('POST', '/retrust', { peer: pos[0] });
 } else if (cmd === 'keygen'){
   const id = sc.generateIdentity();

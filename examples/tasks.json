@@ -1,0 +1,27 @@
+{
+  "maxConcurrent": 2,
+  "allowInterpreters": false,
+  "tasks": {
+    "opencode": {
+      "description": "Run an opencode prompt non-interactively in ~/work",
+      "argv": ["opencode", "run", "{prompt}"],
+      "args": { "prompt": "[^\\u0000]{1,4000}" },
+      "cwd": "~/work",
+      "timeoutMs": 900000,
+      "maxOutput": 1048576,
+      "peers": ["box", "tablet"]
+    },
+    "uptime": {
+      "description": "System uptime",
+      "argv": ["uptime"],
+      "peers": ["*"]
+    },
+    "git-pull": {
+      "description": "git pull a known repo by short name",
+      "argv": ["git", "-C", "{repo}", "pull", "--ff-only"],
+      "args": { "repo": "/data/data/com\\.termux/files/home/work/[a-z0-9-]{1,40}" },
+      "timeoutMs": 120000,
+      "peers": ["box"]
+    }
+  }
+}
