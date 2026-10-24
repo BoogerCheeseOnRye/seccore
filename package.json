@@ -1,0 +1,19 @@
+{
+  "name": "seccore",
+  "version": "1.0.0",
+  "description": "Authenticated encrypted P2P channel",
+  "main": "seccore.mjs",
+  "scripts": {
+    "test": "node --test --test-timeout=10000 test/"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@noble/post-quantum": "^0.7.1"
+  },
+  "bin": {
+    "seccore": "cli.mjs"
+  }
+}
