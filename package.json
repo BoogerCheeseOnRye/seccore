@@ -15,5 +15,8 @@
   },
   "bin": {
     "seccore": "cli.mjs"
+  },
+  "engines": {
+    "node": ">=18.19"
   }
 }
