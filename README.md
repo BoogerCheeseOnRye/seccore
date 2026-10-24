@@ -102,8 +102,8 @@ seccore pair --import SECCORE1:…   # on the other device; shows PAIRING CODE 1
 Do it in both directions. **The pairing code must be the same on both screens.** If it isn't, someone swapped a bundle.
 Bundles carry name, fingerprint and address only, never the canary secret.
 Devices don't have to be paired with *everyone*. A phone paired only with `box` can still reach `tablet`
-through `box` (relay) as long as `phone` and `tablet` have pinned each other. To pin without an address, use
-`seccore pair --import <bundle> --no-addr`… or, simpler, `seccore add-peer --name tablet --fp <fp>`.
+through `box` (relay) as long as `phone` and `tablet` have pinned each other. To pin a device without its address, export its bundle with `seccore pair --no-addr`,
+or run `seccore add-peer --name tablet --fp <fp>`.
 
 Run it:
 ```sh
