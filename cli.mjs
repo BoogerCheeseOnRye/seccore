@@ -34,6 +34,7 @@ Mesh (config: DIR/mesh.json, control token: DIR/control.token):
   seccore daemon                   run the node under an auto-restart supervisor
   seccore peers | status           query the local node
   seccore tasks PEER | task PEER NAME [ARGS_JSON] [--wait] | job PEER ID [status|result|cancel] | jobs PEER
+  seccore revoke NAME|FP|self [--reason R]   signed revocation, gossiped mesh-wide (permanent)
   seccore send TO JSON | broadcast JSON | request TO JSON [--timeout MS] | inbox | retrust NAME
 FP = the other device's fingerprint (compare out-of-band!). Pins saved in DIR/known_peers.json.`;
 
@@ -84,7 +85,7 @@ async function runNode(){
   const alertLog = path.join(dir, 'alerts.log');
   const node = new MeshNode({ identity: await identity(), name: c.name, host: c.host || '127.0.0.1', port: c.port,
     peers: c.peers, canarySecret: await canary(c), decoyPort: c.decoyPort, alertLog, handler,
-    heartbeatMs: c.heartbeatMs, deadMs: c.deadMs, canaryMs: c.canaryMs, maxHops: c.maxHops, acceptRelayFrom: c.acceptRelayFrom, ...(c.limits || {}) });
+    heartbeatMs: c.heartbeatMs, deadMs: c.deadMs, canaryMs: c.canaryMs, maxHops: c.maxHops, acceptRelayFrom: c.acceptRelayFrom, revocation: c.revocation, revokedFile: path.join(dir, 'revoked.json'), ...(c.limits || {}) });
   node.inbox = [];
   const log = (...x) => console.log(new Date().toISOString(), ...x);
   node.on('peer-up', (n, d) => log('peer up', n, d));
@@ -140,6 +141,9 @@ if (cmd === 'mesh-init'){
 } else if (cmd === 'task'){ await ctl('POST', '/request', { to: pos[0], body: { op: a.wait ? 'task.run' : 'task.submit', task: pos[1], args: pos[2] ? JSON.parse(pos[2]) : {} }, timeoutMs: a.wait ? Number(a.timeout || 900000) : undefined });
 } else if (cmd === 'job'){ await ctl('POST', '/request', { to: pos[0], body: { op: 'task.' + (pos[2] || 'result'), id: pos[1] } });
 } else if (cmd === 'jobs'){ await ctl('POST', '/request', { to: pos[0], body: { op: 'task.jobs' } });
+} else if (cmd === 'revoke'){
+  if (!pos[0]) { console.error('usage: seccore revoke PEER_NAME|FINGERPRINT|self [--reason TEXT]'); process.exit(2); }
+  await ctl('POST', '/revoke', { target: pos[0], reason: typeof a.reason === 'string' ? a.reason : '' });
 } else if (cmd === 'retrust'){ await ctl('POST', '/retrust', { peer: pos[0] });
 } else if (cmd === 'encrypt-secrets'){
   // Migration: encrypt identity.pem and mesh.json canarySecret in place with one passphrase.

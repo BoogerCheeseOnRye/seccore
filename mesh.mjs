@@ -11,6 +11,7 @@ import { EventEmitter } from 'node:events';
 import * as sc from './seccore.mjs';
 import { KeyedLimiter } from './ratelimit.mjs';
 import * as e2e from './e2e.mjs';
+import { RevocationStore, signRevocation } from './revoke.mjs';
 
 const MAX_CTL_BODY = 256 * 1024;
 const safeEq = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
@@ -44,6 +45,8 @@ export class MeshNode extends EventEmitter {
     // Relay state: rotating prekeys (memory only), signed node records, dedupe set.
     this.prekeys = new e2e.PrekeyStore({ rotateMs: this.o.prekeyRotateMs ?? 3600_000, keep: this.o.prekeyKeep ?? 2 });
     this.seq = 0;
+    this.revocations = new RevocationStore({ file: this.o.revokedFile, admins: this.o.revocation?.admins, quorum: this.o.revocation?.quorum });
+    for (const st of this.peers.values()) if (this.isRevoked(st.cfg.fingerprint)){ st.trusted = false; st.revoked = true; }
     this.directory = new Map();                   // fp -> verified node record
     this.seen = new Map();                        // relay id -> ts
     this.pending = new Map();                     // request id -> {resolve,reject,timer}
@@ -56,11 +59,13 @@ export class MeshNode extends EventEmitter {
     if (p.fingerprint === this.fp) return;
     this.peers.set(p.name, { cfg: { ...p }, ch: null, lastSeen: 0, rtt: null, trusted: true, strikes: 0, attempt: 0, timer: null, since: null, pendingCanary: null });
     this.byFp.set(p.fingerprint, p.name);
+    if (this.isRevoked?.(p.fingerprint)){ const st = this.peers.get(p.name); st.trusted = false; st.revoked = true; }
     if (dial && this.hbTimer && this._shouldDial(p.name)) this._dial(p.name);
   }
 
   // Pins = exactly the configured, still-trusted peers. Everyone else fails the handshake.
-  _pins(){ return { has: (fp) => { const n = this.byFp.get(fp); return !!n && this.peers.get(n).trusted; } }; }
+  _pins(){ return { has: (fp) => { const n = this.byFp.get(fp); return !!n && this.peers.get(n).trusted && !this.isRevoked(fp); } }; }
+  isRevoked(fp){ return !!this.revocations?.has(fp); }
 
   async start(){
     const tasks = [];
@@ -124,7 +129,7 @@ export class MeshNode extends EventEmitter {
   _attach(ch, dir){
     const name = this.byFp.get(ch.peerFingerprint);
     const st = name && this.peers.get(name);
-    if (!st || !st.trusted) return ch.close();
+    if (!st || !st.trusted || this.isRevoked(ch.peerFingerprint)) return ch.close();
     if (st.ch && st.ch !== ch){ const old = st.ch; st.ch = null; old.removeAllListeners('close'); old.close(); }
     st.ch = ch; st.lastSeen = Date.now(); st.attempt = 0; st.since = Date.now(); st.dir = dir;
     ch.on('message', (m) => this._onMessage(name, ch, m));
@@ -137,6 +142,7 @@ export class MeshNode extends EventEmitter {
     this.emit('peer-up', name, dir);
     this._safeWrite(name, { t: 'rec', recs: [this.rec, ...[...this.directory.values()].map((d) => d.rec)].slice(0, 256) });
     this._schedulePublish();
+    const notices = this.revocations.all(); if (notices.length) this._safeWrite(name, { t: 'revoke', notices: notices.slice(0, 256) });
     if (this.o.canarySecret) this._canary(name);
   }
 
@@ -164,6 +170,7 @@ export class MeshNode extends EventEmitter {
       case 'canary': return this._safeWrite(name, { t: 'canaryRes', c: m.c, mac: this._canaryMac(m.c, st.cfg.fingerprint, this.fp) });
       case 'canaryRes': return this._checkCanary(name, m);
       case 'rec': return this._onRec(name, m);
+      case 'revoke': return this._onRevoke(name, m);
       case 'relay': return this._onRelay(name, m);
       case 'msg': if (st.trusted) this.emit('message', { from: name, body: m.body }); return;
       case 'req': {
@@ -190,6 +197,7 @@ export class MeshNode extends EventEmitter {
   // `to` = configured peer name or a fingerprint. Uses the direct link when up, else relays end-to-end sealed.
   _resolve(to){
     const n = this.peers.has(to) ? to : this.byFp.get(to);
+    if (this.isRevoked(this.peers.get(to)?.cfg.fingerprint ?? to)) throw new Error('peer ' + to + ' is revoked');
     if (n && !this.peers.get(n).trusted) throw new Error('peer ' + n + ' is untrusted');
     if (this.peers.has(to)) return { name: to, fp: this.peers.get(to).cfg.fingerprint };
     if (this.byFp.has(to)) return { name: this.byFp.get(to), fp: to };
@@ -227,15 +235,40 @@ export class MeshNode extends EventEmitter {
       peers: [...this.peers].map(([n, st]) => ({
         name: n, fingerprint: st.cfg.fingerprint, connected: !!st.ch, direction: st.dir ?? null,
         alive: !!st.ch && now - st.lastSeen < this.o.deadMs, lastSeenMsAgo: st.lastSeen ? now - st.lastSeen : null,
-        rttMs: st.rtt, trusted: st.trusted, strikes: st.strikes,
+        rttMs: st.rtt, trusted: st.trusted, revoked: !!st.revoked, strikes: st.strikes,
       })),
       alerts: this.alerts.slice(-50),
     };
   }
   // Operator action after investigating: re-trust a peer that was flagged.
-  retrust(name){ const st = this.peers.get(name); if (!st) return false; st.trusted = true; st.strikes = 0; this._scheduleDial(name); return true; }
+  retrust(name){ const st = this.peers.get(name); if (!st || st.revoked) return false; st.trusted = true; st.strikes = 0; this._scheduleDial(name); return true; }
 
   // ── multi-hop relay ─────────────────────────────────────────────────────
+  // ── revocation ──────────────────────────────────────────────────────────
+  _trustedFps(){ return new Set([...this.peers.values()].filter((st) => st.trusted).map((st) => st.cfg.fingerprint).concat(this.fp)); }
+  revoke(targetFp, reason = ''){
+    if (targetFp === 'self') targetFp = this.fp;
+    return this._ingestRevocation(signRevocation(this.id, targetFp, reason), null);
+  }
+  _onRevoke(from, m){ if (Array.isArray(m.notices)) for (const n of m.notices.slice(0, 256)) this._ingestRevocation(n, from); }
+  _ingestRevocation(notice, from){
+    const r = this.revocations.add(notice, this._trustedFps());
+    if (r.status === 'invalid'){ if (from) this._alert('bad-revocation', from, 'unsigned/invalid revocation notice'); return r; }
+    if (r.status === 'known') return r;
+    if (r.status === 'applied') this._applyRevocation(r.notice);
+    for (const [n, st] of this.peers) if (n !== from && st.ch && st.trusted) this._safeWrite(n, { t: 'revoke', notices: [r.notice] });
+    return r;
+  }
+  _applyRevocation(n){
+    this._alert('revoked', this.byFp.get(n.target) ?? n.target, 'revocation applied (' + n.why + ')' + (n.reason ? ': ' + n.reason : ''));
+    this.directory.delete(n.target);
+    if (n.target === this.fp){ this.emit('self-revoked'); return; }
+    const name = this.byFp.get(n.target); if (!name) return;
+    const st = this.peers.get(name); st.trusted = false; st.revoked = true;
+    // Close after a tick so the gossiped notice reaches the revoked node too.
+    if (st.ch){ const ch = st.ch; setTimeout(() => ch.close(), 50); }
+  }
+
   _myNbrs(){ return [...this.peers.values()].filter((st) => st.ch && st.trusted).map((st) => st.cfg.fingerprint); }
   _makeRecord(){
     this.seq = Math.max(this.seq + 1, Date.now());
@@ -303,6 +336,7 @@ export class MeshNode extends EventEmitter {
     try { env = e2e.open(m.sealed, this.id, this.prekeys); } catch (e) { return this._alert('relay-open-failed', from, e.message); }
     if (env.id !== m.id) return this._alert('relay-open-failed', from, 'outer/inner id mismatch');
     if (Math.abs(Date.now() - env.ts) > (this.o.relayMaxAgeMs ?? 300_000)) return this._alert('relay-stale', from, 'envelope too old/new');
+    if (this.isRevoked(env.src)) return this._alert('relay-revoked-sender', from, 'dropped e2e message from revoked ' + env.src);
     const srcName = this.byFp.get(env.src);
     const acc = this.o.acceptRelayFrom || [];
     const ok = (srcName && this.peers.get(srcName).trusted) || acc.includes('*') || acc.includes(env.src);
@@ -419,6 +453,7 @@ export function startControl(node, { port = 0, token }){
         if (req.method === 'POST' && u.pathname === '/send'){ node.send(b.to, b.body); return reply(res, 200, { ok: true }); }
         if (req.method === 'POST' && u.pathname === '/broadcast') return reply(res, 200, { ok: true, sent: node.broadcast(b.body) });
         if (req.method === 'POST' && u.pathname === '/request') return reply(res, 200, { ok: true, result: await node.request(b.to, b.body, b.timeoutMs) });
+        if (req.method === 'POST' && u.pathname === '/revoke'){ const t = b.target === 'self' ? 'self' : (node.peers.get(b.target)?.cfg.fingerprint ?? b.target); const r = node.revoke(t, b.reason); return reply(res, 200, { ok: r.status !== 'invalid', status: r.status, signers: r.notice?.sigs?.length }); }
         if (req.method === 'POST' && u.pathname === '/retrust') return reply(res, 200, { ok: node.retrust(b.peer) });
         if (req.method === 'GET' && u.pathname === '/inbox'){ const m = node.inbox?.splice(0) ?? []; return reply(res, 200, { ok: true, messages: m }); }
         return reply(res, 404, { ok: false, error: 'not found' });
