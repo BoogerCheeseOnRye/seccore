@@ -12,6 +12,7 @@ import * as sc from './seccore.mjs';
 import { KeyedLimiter } from './ratelimit.mjs';
 import * as e2e from './e2e.mjs';
 import { RevocationStore, signRevocation } from './revoke.mjs';
+import { ReplayStore } from './replay.mjs';
 
 const MAX_CTL_BODY = 256 * 1024;
 const safeEq = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
@@ -48,7 +49,7 @@ export class MeshNode extends EventEmitter {
     this.revocations = new RevocationStore({ file: this.o.revokedFile, admins: this.o.revocation?.admins, quorum: this.o.revocation?.quorum });
     for (const st of this.peers.values()) if (this.isRevoked(st.cfg.fingerprint)){ st.trusted = false; st.revoked = true; }
     this.directory = new Map();                   // fp -> verified node record
-    this.seen = new Map();                        // relay id -> ts
+    this.seen = new ReplayStore({ file: this.o.replayFile, windowMs: 2 * (this.o.relayMaxAgeMs ?? 300_000) }); // persisted relay ids
     this.pending = new Map();                     // request id -> {resolve,reject,timer}
     this.alerts = [];
     this.stopped = false;
@@ -294,12 +295,7 @@ export class MeshNode extends EventEmitter {
     }
     if (fresh.length) for (const [n, st] of this.peers) if (n !== from && st.ch && st.trusted) this._safeWrite(n, { t: 'rec', recs: fresh });
   }
-  _markSeen(id){
-    const now = Date.now();
-    if (this.seen.size > 20_000) for (const [k, t] of this.seen){ if (now - t > 600_000 || this.seen.size > 15_000) this.seen.delete(k); else break; }
-    if (this.seen.has(id)) return false;
-    this.seen.set(id, now); return true;
-  }
+  _markSeen(id){ return this.seen.add(id); }
   _relaySend(dstFp, inner){
     const d = this.directory.get(dstFp);
     if (!d) throw new Error('no route/key for ' + dstFp + ' (not yet announced in the mesh)');
@@ -417,6 +413,7 @@ export class MeshNode extends EventEmitter {
     this.stopped = true;
     clearInterval(this.hbTimer); clearInterval(this.canaryTimer); clearInterval(this.rotTimer); clearTimeout(this.pubTimer);
     this.prekeys.destroyAll();
+    try { this.seen.flush(); } catch {}
     for (const [, st] of this.peers){ clearTimeout(st.timer); st.timer = null; if (st.pendingCanary) clearTimeout(st.pendingCanary.timer); if (st.ch){ const c = st.ch; st.ch = null; c.sock.destroy(); } }
     for (const [, p] of this.pending){ clearTimeout(p.timer); p.reject(new Error('node stopped')); }
     this.pending.clear();
