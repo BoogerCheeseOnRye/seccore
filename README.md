@@ -80,43 +80,103 @@ so mesh traffic is never sent in plaintext and can't come from an unpinned key.
 
 On **every** device:
 ```sh
-pkg install nodejs git            # Termux; on Linux use your package manager
-git clone https://github.com/BoogerCheeseOnRye/seccore && cd seccore && npm install
-alias seccore="node $PWD/cli.mjs"
-seccore keygen && seccore fingerprint
+# Termux
+pkg install -y git && git clone https://github.com/BoogerCheeseOnRye/seccore && cd seccore
+bash scripts/termux-setup.sh --service --boot      # deps, `seccore` launcher, keygen, autostart
+# Linux: git clone ... && cd seccore && npm ci && alias seccore="node $PWD/cli.mjs" && seccore keygen
 ```
-On the **first** device (e.g. the Linux box, LAN IP 192.168.1.10):
-```sh
-seccore mesh-init --name box --host 192.168.1.10 --port 7400
-grep canarySecret ~/.seccore/mesh.json      # copy this value to the other devices in person, never over chat
-```
-On each **other** device (here a tablet that also listens on 192.168.1.20):
-```sh
-seccore mesh-init --name tablet --host 192.168.1.20 --port 7400 --canary <secret from box>
-```
-(For a phone that only dials out, `--host 127.0.0.1` is fine.)
-Then pin everyone on every device. Compare the fingerprints in person:
-```sh
-seccore add-peer --name box    --fp <box fp>    --host 192.168.1.10 --port 7400
-seccore add-peer --name tablet --fp <tablet fp> --host 192.168.1.20 --port 7400
-seccore add-peer --name phone  --fp <phone fp>               # no host = it dials us
-```
-Run it and use it:
-```sh
-seccore daemon &                                   # Termux: `termux-wake-lock` first to keep it alive
-seccore peers
-seccore send tablet '{"note":"hi"}'
-seccore broadcast '{"alert":"rotate keys tonight"}'
-seccore request box '{"op":"ping"}'
-seccore inbox                                      # messages received by this node
-seccore status                                     # peers, liveness, RTT, trust, alerts
-```
-If your devices aren't on the same LAN, open the port on one reachable host or join them over a VPN you trust.
-Seccore authenticates and encrypts on its own, so the network underneath doesn't need to be trusted.
+To encrypt the key at rest, run `seccore keygen --encrypt` instead of plain `keygen`, or `seccore encrypt-secrets` later.
 
-### Mesh limitations
-- Routing is direct only: two nodes have to be configured as peers to talk (no multi-hop relay yet).
-- The canary catches a stolen identity key used *without* the canary secret, plus mis-configured or modified nodes. It can't catch
-  an attacker who fully controls a device, because they'd have both secrets.
-- `mesh.json` stores the canary secret in plaintext (mode 600), and `identity.pem` isn't passphrase-protected.
-- Request/response has no rate limiting yet. Your handler is the trust boundary.
+Create the mesh. One device generates the canary secret and the others reuse it:
+```sh
+seccore mesh-init --name box --host 192.168.1.10 --port 7400        # first device
+grep canarySecret ~/.seccore/mesh.json                               # copy this value in person
+seccore mesh-init --name tablet --host 192.168.1.20 --port 7400 --canary <secret>
+seccore mesh-init --name phone --canary <secret>                     # dial-only phone (no listener needed)
+```
+Pair the devices (instead of typing fingerprints by hand):
+```sh
+seccore pair                       # prints SECCORE1:… bundle (+ QR if qrencode is installed)
+seccore pair --import SECCORE1:…   # on the other device; shows PAIRING CODE 123-456
+```
+Do it in both directions. **The pairing code must be the same on both screens.** If it isn't, someone swapped a bundle.
+Bundles carry name, fingerprint and address only, never the canary secret.
+Devices don't have to be paired with *everyone*. A phone paired only with `box` can still reach `tablet`
+through `box` (relay) as long as `phone` and `tablet` have pinned each other. To pin without an address, use
+`seccore pair --import <bundle> --no-addr`… or, simpler, `seccore add-peer --name tablet --fp <fp>`.
+
+Run it:
+```sh
+sv up seccore            # Termux with --service (or: termux-wake-lock; seccore daemon &)
+seccore daemon &         # Linux
+seccore peers ; seccore status
+seccore send tablet '{"note":"hi"}' ; seccore broadcast '{"alert":"x"}' ; seccore inbox
+seccore request box '{"op":"ping"}'
+```
+If identity/canary are encrypted, the daemon needs `SECCORE_PASSPHRASE` set (or `~/.seccore/passphrase` for the
+Termux service, which weakens the protection; your choice). Off-LAN devices need one reachable host or a network you
+already have between them. seccore doesn't trust the network underneath.
+
+## Tasks: letting agents on one device run things on another (`tasks.mjs`)
+
+A peer can only run tasks declared in `~/.seccore/tasks.json` on the *target* device. There's no shell, and interpreters
+(`sh`, `bash`, `python`, `node`, `env`, `sudo`, …) are refused unless the config sets both
+`"allowInterpreters": true` and that task's `"allowInterpreter": true`. Rules:
+- `argv[0]` is a literal program. A placeholder like `{prompt}` must be a *whole* argv element, and its value has to match
+  the arg's regex, which is always auto-anchored (`^(?:…)$`). Unknown args, missing args and NUL bytes are rejected.
+- `peers` lists who may call the task (`["*"]` = any trusted peer). Jobs are visible only to the peer that submitted them.
+- `spawn` without a shell, scrubbed env (`PATH`, `HOME`, `LANG`, `TMPDIR` + the task's own `env`), `cwd`, `timeoutMs`,
+  `maxOutput` (the process is killed when exceeded), and a global `maxConcurrent` job cap.
+
+```json
+{
+  "maxConcurrent": 2,
+  "tasks": {
+    "opencode": { "description": "Run an opencode prompt", "argv": ["opencode", "run", "{prompt}"],
+                  "args": { "prompt": "[^\\u0000]{1,4000}" }, "cwd": "~/work",
+                  "timeoutMs": 900000, "maxOutput": 1048576, "peers": ["box", "tablet"] },
+    "uptime":   { "argv": ["uptime"], "peers": ["*"] }
+  }
+}
+```
+(Also in `examples/tasks.json`.) Note that `opencode run` is itself an agent that can edit files in `cwd`. Point it at a
+dedicated work directory and only allow peers you trust with that power.
+
+```sh
+seccore tasks box                                   # what am I allowed to run on box?
+seccore task box opencode '{"prompt":"fix the failing test"}'      # async -> {"id": "..."}
+seccore job box <id> status | result | cancel ; seccore jobs box
+seccore task box uptime --wait                      # synchronous
+```
+Requests and messages also work over relay, so a task can be submitted to a device you aren't directly linked to.
+
+## Rate limits
+Per-peer token bucket on messages, requests and relay frames (default 50/s, burst 100; over budget = dropped, and requests get
+`rate limited`), plus a per-IP budget checked *before* the handshake (default 2/s, burst 10). Tune with
+`"limits": {"peerRate":…, "peerBurst":…, "handshakeRate":…, "handshakeBurst":…}` in `mesh.json`.
+
+## Multi-hop relay
+Each node derives a static X25519 "box" key from its identity and publishes it in an announcement signed with Ed25519.
+Announcements gossip over the mesh, so a node learns the box key for any fingerprint and can check its signature.
+A relayed message is an envelope **sealed to the recipient** (ephemeral X25519 → HKDF → ChaCha20-Poly1305, header as AAD) and
+**signed by the sender's** Ed25519 key. Relays forward it (flooding to trusted neighbours, or direct when the destination is
+a neighbour) and only see sender/recipient fingerprints, an id, the TTL and the size. Protections: hop limit (`maxHops`, default 8),
+deduplication by id, loop prevention (path list), and the recipient rejects envelopes older than 5 min. The recipient
+accepts only senders it has pinned (or `"acceptRelayFrom": ["*" | fp…]`).
+
+## Threat model updates
+- **Compromised relay:** it can't read, forge or alter relayed payloads, but it can drop them, delay them (within 5 min) and see
+  who talks to whom, when, and how much.
+- **Compromised peer:** it can do whatever its allowed tasks permit on the devices that granted them. Keep task lists tight and
+  regexes narrow. The canary flags nodes that lack the mesh secret, but not an attacker who has fully taken over a node.
+- **Stolen device:** with `encrypt-secrets`, the identity key and canary secret need the passphrase (scrypt, N=2^15). Without it,
+  they sit in plaintext (mode 600). A `passphrase` file for autostart cancels this protection.
+- **Floods:** rate limits bound CPU spent on handshakes and requests. They don't stop a network-level DoS.
+
+### Remaining limitations
+- Relay routing floods. That's fine for a handful of devices, but wasteful for large meshes, and there's no route learning yet.
+- Box keys are static (no forward secrecy for *relayed* messages if a node's identity key leaks later). Direct links do have it.
+- Revoking a key means removing it from every device by hand (no signed revocation broadcast yet).
+- Relay envelope replay is limited to 5 min plus an in-memory dedupe that is lost when the node restarts.
+- The prompt-based unlock needs a TTY. Services have to use the env var or the passphrase file.
+- This code isn't independently audited.
