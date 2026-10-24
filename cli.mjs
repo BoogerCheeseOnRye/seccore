@@ -9,6 +9,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MeshNode, startControl, ensureToken, loadMeshConfig } from './mesh.mjs';
 import { TaskRunner, loadTasks, taskHandler } from './tasks.mjs';
+import * as secrets from './secrets.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
 const a = {}, pos = [];
@@ -18,7 +19,8 @@ for (let i = 0; i < rest.length; i++){
 }
 const dir = a.home || sc.defaultDir();
 const usage = `usage:
-  seccore keygen [--home DIR]
+  seccore keygen [--home DIR] [--encrypt]
+  seccore encrypt-secrets          encrypt identity.pem + canary secret with a passphrase (migration)
   seccore fingerprint [--home DIR]
   seccore listen  --port P [--host 127.0.0.1] (--peer FP | --tofu)
   seccore connect --host H --port P (--peer FP | --tofu)
@@ -32,10 +34,10 @@ Mesh (config: DIR/mesh.json, control token: DIR/control.token):
   seccore send TO JSON | broadcast JSON | request TO JSON [--timeout MS] | inbox | retrust NAME
 FP = the other device's fingerprint (compare out-of-band!). Pins saved in DIR/known_peers.json.`;
 
-function opts(){
+async function opts(){
   const pins = new sc.PinStore(path.join(dir, 'known_peers.json'));
   if (!a.peer && !a.tofu && !Object.keys(pins.pins).length) { console.error('need --peer FP or --tofu (no pinned peers yet)'); process.exit(2); }
-  return { identity: sc.loadIdentity(dir), pins, peerFingerprint: typeof a.peer === 'string' ? a.peer : undefined, tofu: !!a.tofu, port: Number(a.port), host: a.host };
+  return { identity: await identity(), pins, peerFingerprint: typeof a.peer === 'string' ? a.peer : undefined, tofu: !!a.tofu, port: Number(a.port), host: a.host };
 }
 function chat(ch){
   console.error('secure channel up · peer ' + ch.peerFingerprint);
@@ -46,6 +48,18 @@ function chat(ch){
   process.stdin.on('end', () => ch.close());
 }
 
+async function identity(){
+  if (sc.identityIsEncrypted(dir)){
+    const p = await secrets.getPassphrase('unlock identity (' + dir + '): ');
+    return sc.loadIdentity(dir, p);
+  }
+  return sc.loadIdentity(dir);
+}
+let cachedPass = null;
+async function canary(c){
+  if (c.canarySecretEnc){ cachedPass ??= process.env.SECCORE_PASSPHRASE || await secrets.getPassphrase('unlock canary secret: '); return secrets.open(c.canarySecretEnc, cachedPass).toString(); }
+  return c.canarySecret;
+}
 const meshFile = path.join(dir, 'mesh.json');
 const tokenFile = path.join(dir, 'control.token');
 const saveMesh = (c) => fs.writeFileSync(meshFile, JSON.stringify(c, null, 2) + '\n', { mode: 0o600 });
@@ -65,8 +79,8 @@ async function runNode(){
   const runner = fs.existsSync(tasksFile) ? new TaskRunner(loadTasks(tasksFile)) : null;
   const handler = taskHandler(runner, custom);
   const alertLog = path.join(dir, 'alerts.log');
-  const node = new MeshNode({ identity: sc.loadIdentity(dir), name: c.name, host: c.host || '127.0.0.1', port: c.port,
-    peers: c.peers, canarySecret: c.canarySecret, decoyPort: c.decoyPort, alertLog, handler,
+  const node = new MeshNode({ identity: await identity(), name: c.name, host: c.host || '127.0.0.1', port: c.port,
+    peers: c.peers, canarySecret: await canary(c), decoyPort: c.decoyPort, alertLog, handler,
     heartbeatMs: c.heartbeatMs, deadMs: c.deadMs, canaryMs: c.canaryMs, ...(c.limits || {}) });
   node.inbox = [];
   const log = (...x) => console.log(new Date().toISOString(), ...x);
@@ -124,16 +138,35 @@ if (cmd === 'mesh-init'){
 } else if (cmd === 'job'){ await ctl('POST', '/request', { to: pos[0], body: { op: 'task.' + (pos[2] || 'result'), id: pos[1] } });
 } else if (cmd === 'jobs'){ await ctl('POST', '/request', { to: pos[0], body: { op: 'task.jobs' } });
 } else if (cmd === 'retrust'){ await ctl('POST', '/retrust', { peer: pos[0] });
+} else if (cmd === 'encrypt-secrets'){
+  // Migration: encrypt identity.pem and mesh.json canarySecret in place with one passphrase.
+  const pass = await secrets.getPassphrase('new passphrase: ', { confirm: true });
+  if (!pass) { console.error('no passphrase (set SECCORE_PASSPHRASE or use a TTY)'); process.exit(2); }
+  const plain = path.join(dir, 'identity.pem');
+  if (fs.existsSync(plain)){
+    const id = sc.loadIdentity(dir); sc.saveIdentityEncrypted(id, pass, dir);
+    if (sc.fingerprint(sc.loadIdentity(dir, pass).raw) !== sc.fingerprint(id.raw)) throw new Error('verify failed');
+    fs.renameSync(plain, plain + '.migrating'); if (!sc.identityIsEncrypted(dir)) throw new Error('migration failed');
+    secrets.shred(plain + '.migrating'); console.log('identity encrypted -> identity.pem.enc');
+  } else console.log('identity: already encrypted or missing');
+  if (fs.existsSync(meshFile)){
+    const c = JSON.parse(fs.readFileSync(meshFile, 'utf8'));
+    if (c.canarySecret){ c.canarySecretEnc = secrets.seal(c.canarySecret, pass, undefined, 'seccore-canary'); delete c.canarySecret; saveMesh(c); console.log('mesh.json canarySecret encrypted'); }
+  }
+  console.log('Unlock at start with SECCORE_PASSPHRASE=... or the prompt. There is no recovery if you forget it.');
 } else if (cmd === 'keygen'){
   const id = sc.generateIdentity();
-  try { console.log('wrote ' + sc.saveIdentity(id, dir)); } catch (e) { console.error(e.code === 'EEXIST' ? 'identity already exists in ' + dir : e.message); process.exit(1); }
+  if (sc.identityIsEncrypted(dir) || fs.existsSync(path.join(dir, 'identity.pem'))) { console.error('identity already exists in ' + dir); process.exit(1); }
+  let pass = null;
+  if (a.encrypt){ pass = await secrets.getPassphrase('new passphrase: ', { confirm: true }); if (!pass) { console.error('no passphrase (set SECCORE_PASSPHRASE or use a TTY)'); process.exit(2); } }
+  try { console.log('wrote ' + (pass ? sc.saveIdentityEncrypted(id, pass, dir) : sc.saveIdentity(id, dir))); } catch (e) { console.error(e.code === 'EEXIST' ? 'identity already exists in ' + dir : e.message); process.exit(1); }
   console.log('fingerprint ' + sc.fingerprint(id.raw));
 } else if (cmd === 'fingerprint'){
-  console.log(sc.fingerprint(sc.loadIdentity(dir).raw));
+  console.log(sc.fingerprint((await identity()).raw));
 } else if (cmd === 'listen'){
-  const o = opts(); let busy = false;
+  const o = await opts(); let busy = false;
   const srv = sc.listen({ ...o, host: o.host || '127.0.0.1' }, (ch) => { if (busy) return ch.close(); busy = true; chat(ch); }, (e) => console.error('rejected: ' + e.message));
   srv.on('listening', () => console.error('listening on ' + (o.host || '127.0.0.1') + ':' + o.port + ' · my fp ' + sc.fingerprint(o.identity.raw)));
 } else if (cmd === 'connect'){
-  sc.connect(opts()).then(chat, (e) => { console.error('handshake failed: ' + e.message); process.exit(1); });
+  sc.connect(await opts()).then(chat, (e) => { console.error('handshake failed: ' + e.message); process.exit(1); });
 } else { console.log(usage); process.exit(cmd ? 2 : 0); }

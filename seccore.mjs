@@ -9,6 +9,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
 import { ml_kem768 } from '@noble/post-quantum/ml-kem.js';
+import * as secrets from './secrets.mjs';
 
 export const VERSION = 'seccore-v1';
 const MAX_FRAME = 1 << 20;            // 1 MiB
@@ -41,8 +42,20 @@ export function saveIdentity(id, dir = defaultDir()){
   fs.writeFileSync(f, id.privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600, flag: 'wx' });
   return f;
 }
-export function loadIdentity(dir = defaultDir()){
-  const privateKey = crypto.createPrivateKey(fs.readFileSync(path.join(dir, 'identity.pem')));
+export function saveIdentityEncrypted(id, passphrase, dir = defaultDir(), kdf){
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const f = path.join(dir, 'identity.pem.enc');
+  const pem = id.privateKey.export({ type: 'pkcs8', format: 'pem' });
+  fs.writeFileSync(f, JSON.stringify(secrets.seal(pem, passphrase, kdf, 'seccore-identity')), { mode: 0o600, flag: 'wx' });
+  return f;
+}
+export function identityIsEncrypted(dir = defaultDir()){ return !fs.existsSync(path.join(dir, 'identity.pem')) && fs.existsSync(path.join(dir, 'identity.pem.enc')); }
+// Loads identity.pem, or identity.pem.enc unlocked with `passphrase` (or $SECCORE_PASSPHRASE).
+export function loadIdentity(dir = defaultDir(), passphrase = process.env.SECCORE_PASSPHRASE){
+  const enc = path.join(dir, 'identity.pem.enc');
+  const pem = fs.existsSync(path.join(dir, 'identity.pem')) ? fs.readFileSync(path.join(dir, 'identity.pem'))
+    : fs.existsSync(enc) ? secrets.open(JSON.parse(fs.readFileSync(enc, 'utf8')), passphrase) : fs.readFileSync(path.join(dir, 'identity.pem'));
+  const privateKey = crypto.createPrivateKey(pem);
   const publicKey = crypto.createPublicKey(privateKey);
   return { privateKey, publicKey, raw: rawPub(publicKey) };
 }
