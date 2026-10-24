@@ -41,10 +41,10 @@ export class MeshNode extends EventEmitter {
     // Per-peer message/request budget and per-IP handshake budget.
     this.msgLimit = new KeyedLimiter(this.o.peerRate ?? 50, this.o.peerBurst ?? 100);
     this.hsLimit = new KeyedLimiter(this.o.handshakeRate ?? 2, this.o.handshakeBurst ?? 10);
-    // Relay state: box key + signed announcement, directory of verified box keys, dedupe set.
-    this.box = e2e.boxKeyFromIdentity(this.id);
-    this.ann = e2e.makeAnnouncement(this.id, this.box);
-    this.directory = new Map();                   // fp -> { x, ed }
+    // Relay state: rotating prekeys (memory only), signed node records, dedupe set.
+    this.prekeys = new e2e.PrekeyStore({ rotateMs: this.o.prekeyRotateMs ?? 3600_000, keep: this.o.prekeyKeep ?? 2 });
+    this.seq = 0;
+    this.directory = new Map();                   // fp -> verified node record
     this.seen = new Map();                        // relay id -> ts
     this.pending = new Map();                     // request id -> {resolve,reject,timer}
     this.alerts = [];
@@ -78,6 +78,8 @@ export class MeshNode extends EventEmitter {
       tasks.push(new Promise((r) => this.decoy.once('listening', r)));
     }
     await Promise.all(tasks);
+    this.rec = this._makeRecord();
+    this.rotTimer = setInterval(() => { this.prekeys.rotate(); this._publish(); }, this.o.prekeyRotateMs ?? 3600_000); this.rotTimer.unref?.();
     for (const [name] of this.peers) if (this._shouldDial(name)) this._dial(name);
     this.hbTimer = setInterval(() => this._tick(), this.o.heartbeatMs); this.hbTimer.unref?.();
     if (this.o.canarySecret){ this.canaryTimer = setInterval(() => this._canaryAll(), this.o.canaryMs); this.canaryTimer.unref?.(); }
@@ -129,11 +131,12 @@ export class MeshNode extends EventEmitter {
     ch.on('error', (e) => this.emit('channel-error', name, e));
     ch.on('close', () => {
       if (st.ch !== ch) return;
-      st.ch = null; st.since = null; this.emit('peer-down', name);
+      st.ch = null; st.since = null; this.emit('peer-down', name); this._schedulePublish();
       this._scheduleDial(name);
     });
     this.emit('peer-up', name, dir);
-    this._safeWrite(name, { t: 'ann', anns: [this.ann, ...[...this.directory.values()].map((d) => d.ann)] });
+    this._safeWrite(name, { t: 'rec', recs: [this.rec, ...[...this.directory.values()].map((d) => d.rec)].slice(0, 256) });
+    this._schedulePublish();
     if (this.o.canarySecret) this._canary(name);
   }
 
@@ -160,7 +163,7 @@ export class MeshNode extends EventEmitter {
       case 'hbAck': if (typeof m.ts === 'number') st.rtt = Date.now() - m.ts; return;
       case 'canary': return this._safeWrite(name, { t: 'canaryRes', c: m.c, mac: this._canaryMac(m.c, st.cfg.fingerprint, this.fp) });
       case 'canaryRes': return this._checkCanary(name, m);
-      case 'ann': return this._onAnn(name, m);
+      case 'rec': return this._onRec(name, m);
       case 'relay': return this._onRelay(name, m);
       case 'msg': if (st.trusted) this.emit('message', { from: name, body: m.body }); return;
       case 'req': {
@@ -233,18 +236,30 @@ export class MeshNode extends EventEmitter {
   retrust(name){ const st = this.peers.get(name); if (!st) return false; st.trusted = true; st.strikes = 0; this._scheduleDial(name); return true; }
 
   // ── multi-hop relay ─────────────────────────────────────────────────────
-  _onAnn(from, m){
-    if (!Array.isArray(m.anns)) return;
+  _myNbrs(){ return [...this.peers.values()].filter((st) => st.ch && st.trusted).map((st) => st.cfg.fingerprint); }
+  _makeRecord(){
+    this.seq = Math.max(this.seq + 1, Date.now());
+    return e2e.makeRecord(this.id, { seq: this.seq, prekey: this.prekeys.publicInfo(), nbrs: this._myNbrs() });
+  }
+  _schedulePublish(){ if (this.pubTimer || this.stopped) return; this.pubTimer = setTimeout(() => { this.pubTimer = null; this._publish(); }, 50); this.pubTimer.unref?.(); }
+  _publish(){
+    if (this.stopped) return;
+    this.rec = this._makeRecord();
+    for (const [n, st] of this.peers) if (st.ch && st.trusted) this._safeWrite(n, { t: 'rec', recs: [this.rec] });
+  }
+  _onRec(from, m){
+    if (!Array.isArray(m.recs)) return;
     const fresh = [];
-    for (const ann of m.anns.slice(0, 256)){
-      let v; try { v = e2e.verifyAnnouncement(ann); } catch { this._alert('bad-announcement', from, 'invalid signed box key'); continue; }
-      if (v.fp === this.fp) continue;
+    for (const rec of m.recs.slice(0, 256)){
+      let v; try { v = e2e.verifyRecord(rec); } catch { this._alert('bad-record', from, 'invalid signed node record'); continue; }
+      if (v.fp === this.fp || this.isRevoked?.(v.fp)) continue;
+      if (v.seq > Date.now() + 600_000) continue;                         // refuse far-future seq (would freeze updates)
       const cur = this.directory.get(v.fp);
-      if (cur && cur.x.equals(v.x)) continue;
+      if (cur && cur.seq >= v.seq) continue;
       if (!cur && this.directory.size >= (this.o.maxDirectory ?? 1000)) continue;
-      this.directory.set(v.fp, { x: v.x, ed: v.ed, ann }); fresh.push(ann);
+      this.directory.set(v.fp, v); fresh.push(rec);
     }
-    if (fresh.length) for (const [n, st] of this.peers) if (n !== from && st.ch && st.trusted) this._safeWrite(n, { t: 'ann', anns: fresh });
+    if (fresh.length) for (const [n, st] of this.peers) if (n !== from && st.ch && st.trusted) this._safeWrite(n, { t: 'rec', recs: fresh });
   }
   _markSeen(id){
     const now = Date.now();
@@ -256,15 +271,19 @@ export class MeshNode extends EventEmitter {
     const d = this.directory.get(dstFp);
     if (!d) throw new Error('no route/key for ' + dstFp + ' (not yet announced in the mesh)');
     const id = crypto.randomBytes(16).toString('hex');
-    const sealed = e2e.seal({ identity: this.id, dstFp, dstX: d.x, body: inner, id });
+    const sealed = e2e.seal({ identity: this.id, dstFp, prekey: d.pk, body: inner, id });
     this._markSeen(id);
     const n = this._forward({ t: 'relay', id, dst: dstFp, ttl: this.o.maxHops ?? 8, path: [this.fp], sealed }, null);
     if (!n) throw new Error('no connected peers to relay through');
   }
-  // Flood to trusted neighbours not already on the path; straight to the destination if it is a neighbour.
+  // Direct if the destination is a neighbour; else the learned link-state next hop; else flood.
   _forward(frame, from){
     const dstName = this.byFp.get(frame.dst);
     if (dstName && this._direct({ name: dstName })){ this._safeWrite(dstName, frame); return 1; }
+    const hop = e2e.nextHop(this.fp, this._myNbrs(), this.directory, frame.dst, this.o.maxDirectory ?? 1000);
+    const hopName = hop && this.byFp.get(hop);
+    if (hopName && hopName !== from && this._direct({ name: hopName }) && !frame.path.includes(hop)){ this.emit('routed', frame.id, hopName); this._safeWrite(hopName, frame); return 1; }
+    this.emit('flooded', frame.id);
     let n = 0;
     for (const [name, st] of this.peers){
       if (name === from || !st.ch || !st.trusted || frame.path.includes(st.cfg.fingerprint)) continue;
@@ -281,7 +300,7 @@ export class MeshNode extends EventEmitter {
       return this._forward({ ...m, ttl: m.ttl - 1, path: [...m.path, this.fp] }, from);
     }
     let env;
-    try { env = e2e.open(m.sealed, this.id, this.box); } catch (e) { return this._alert('relay-open-failed', from, e.message); }
+    try { env = e2e.open(m.sealed, this.id, this.prekeys); } catch (e) { return this._alert('relay-open-failed', from, e.message); }
     if (env.id !== m.id) return this._alert('relay-open-failed', from, 'outer/inner id mismatch');
     if (Math.abs(Date.now() - env.ts) > (this.o.relayMaxAgeMs ?? 300_000)) return this._alert('relay-stale', from, 'envelope too old/new');
     const srcName = this.byFp.get(env.src);
@@ -362,7 +381,8 @@ export class MeshNode extends EventEmitter {
 
   async stop(){
     this.stopped = true;
-    clearInterval(this.hbTimer); clearInterval(this.canaryTimer);
+    clearInterval(this.hbTimer); clearInterval(this.canaryTimer); clearInterval(this.rotTimer); clearTimeout(this.pubTimer);
+    this.prekeys.destroyAll();
     for (const [, st] of this.peers){ clearTimeout(st.timer); st.timer = null; if (st.pendingCanary) clearTimeout(st.pendingCanary.timer); if (st.ch){ const c = st.ch; st.ch = null; c.sock.destroy(); } }
     for (const [, p] of this.pending){ clearTimeout(p.timer); p.reject(new Error('node stopped')); }
     this.pending.clear();

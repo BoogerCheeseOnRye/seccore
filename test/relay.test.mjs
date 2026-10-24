@@ -38,7 +38,7 @@ test('relay cannot read or alter the payload', async () => {
   await until(() => got.length === 1);
   const f = seenAtB[0];
   assert.ok(!JSON.stringify(f).includes('launch-code-42'));
-  assert.throws(() => e2e.open(f.sealed, n.b.id, n.b.box), /not for me/);
+  assert.throws(() => e2e.open(f.sealed, n.b.id, n.b.prekeys), /not for me/);
   // now tamper in transit
   n.b._forward = (frame, from) => { const ct = Buffer.from(frame.sealed.ct, 'base64'); ct[0] ^= 1; return orig({ ...frame, sealed: { ...frame.sealed, ct: ct.toString('base64') } }, from); };
   n.a.send('c', { secret: 'second' });
@@ -73,10 +73,56 @@ test('e2e message from an unpaired sender is dropped', async () => {
   await stop();
 });
 
-test('forged announcement is rejected', () => {
-  const id = sc.generateIdentity(), other = sc.generateIdentity();
-  const ann = e2e.makeAnnouncement(id, e2e.boxKeyFromIdentity(id));
-  assert.equal(e2e.verifyAnnouncement(ann).fp, sc.fingerprint(id.raw));
-  const forged = { ...ann, x: e2e.makeAnnouncement(other, e2e.boxKeyFromIdentity(other)).x };
-  assert.throws(() => e2e.verifyAnnouncement(forged), /signature/);
+test('forged or tampered node record is rejected', () => {
+  const id = sc.generateIdentity(), pk = new e2e.PrekeyStore();
+  const rec = e2e.makeRecord(id, { seq: 1, prekey: pk.publicInfo(), nbrs: [] });
+  assert.equal(e2e.verifyRecord(rec).fp, sc.fingerprint(id.raw));
+  const o = JSON.parse(rec.body); o.nbrs = ['aaaa:bbbb:cccc:dddd:eeee:ffff:0000:1111:2222:3333'];
+  assert.throws(() => e2e.verifyRecord({ body: JSON.stringify(o), sig: rec.sig }), /signature/);
+  const other = new e2e.PrekeyStore(); o.nbrs = []; o.pk = other.publicInfo();
+  assert.throws(() => e2e.verifyRecord({ body: JSON.stringify(o), sig: rec.sig }), /signature/);
+});
+
+test('forward secrecy: captured envelope is undecryptable after prekey rotation, even with the identity key', async () => {
+  const { n, stop } = await topo(['a', 'b', 'c'], [['a', 'b'], ['b', 'c']], [['a', 'c']]);
+  const captured = [];
+  const orig = n.b._forward.bind(n.b);
+  n.b._forward = (frame, from) => { captured.push(JSON.parse(JSON.stringify(frame))); return orig(frame, from); };
+  const got = []; n.c.on('message', (m) => got.push(m));
+  n.a.send('c', { secret: 'past-message' });
+  await until(() => got.length === 1);
+  const env = captured[0].sealed;
+  assert.equal(e2e.open(env, n.c.id, n.c.prekeys).body.body.secret, 'past-message');   // still in grace window
+  for (let i = 0; i < 3; i++) n.c.prekeys.rotate();                                    // keep=2: old key destroyed
+  // Attacker steals c's identity key AND all live prekey state now:
+  assert.throws(() => e2e.open(env, n.c.id, n.c.prekeys), /forward secrecy/);
+  // and the destroyed key material really is gone
+  assert.ok(n.c.prekeys.keys.every((k) => k.id !== JSON.parse(env.hdr).pk));
+  await stop();
+});
+
+test('learned link-state routes: unicast along the path, no flooding', async () => {
+  // line a-b-c-d plus a side branch b-e; a→d must go a→b→c→d and never visit e.
+  const { n, stop } = await topo(['a', 'b', 'c', 'd', 'e'], [['a', 'b'], ['b', 'c'], ['c', 'd'], ['b', 'e']], [['a', 'd']]);
+  await until(() => ['a', 'b', 'c'].every((x) => e2e.nextHop(n[x].fp, n[x]._myNbrs(), n[x].directory, n.d.fp)));
+  const ev = []; for (const x of ['a', 'b', 'c']){ n[x].on('routed', (id, hop) => ev.push(x + '>' + hop)); n[x].on('flooded', () => ev.push(x + ':flood')); }
+  let eSaw = 0; const oe = n.e._onRelay.bind(n.e); n.e._onRelay = (...a) => { eSaw++; return oe(...a); };
+  const got = []; n.d.on('message', (m) => got.push(m));
+  n.a.send('d', 'routed!');
+  await until(() => got.length === 1); await wait(100);
+  assert.deepEqual(ev, ['a>b', 'b>c']);         // c→d is a direct neighbour delivery
+  assert.equal(eSaw, 0);
+  await stop();
+});
+
+test('one-sided adjacency claims do not create routes', () => {
+  const mk = () => { const id = sc.generateIdentity(); return { id, fp: sc.fingerprint(id.raw), pk: new e2e.PrekeyStore() }; };
+  const [me, x, y] = [mk(), mk(), mk()];
+  const recs = new Map();
+  // x claims to neighbour y, but y does not list x
+  recs.set(x.fp, e2e.verifyRecord(e2e.makeRecord(x.id, { seq: 1, prekey: x.pk.publicInfo(), nbrs: [me.fp, y.fp] })));
+  recs.set(y.fp, e2e.verifyRecord(e2e.makeRecord(y.id, { seq: 1, prekey: y.pk.publicInfo(), nbrs: [] })));
+  assert.equal(e2e.nextHop(me.fp, [x.fp], recs, y.fp), null);
+  recs.set(y.fp, e2e.verifyRecord(e2e.makeRecord(y.id, { seq: 2, prekey: y.pk.publicInfo(), nbrs: [x.fp] })));
+  assert.equal(e2e.nextHop(me.fp, [x.fp], recs, y.fp), x.fp);
 });
