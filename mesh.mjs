@@ -31,7 +31,7 @@ export class MeshNode extends EventEmitter {
    */
   constructor(opts){
     super();
-    this.o = { host: '127.0.0.1', heartbeatMs: 5000, deadMs: 15000, canaryMs: 30000, backoffMinMs: 500, backoffMaxMs: 30000, requestTimeoutMs: 15000, ...opts };
+    this.o = { host: '127.0.0.1', heartbeatMs: 5000, deadMs: 15000, canaryMs: 30000, backoffMinMs: 500, backoffMaxMs: 30000, requestTimeoutMs: 15000, ...Object.fromEntries(Object.entries(opts).filter(([, v]) => v !== undefined)) };
     this.id = opts.identity; this.name = opts.name; this.fp = sc.fingerprint(this.id.raw);
     this.peers = new Map();                       // name -> state
     this.byFp = new Map();                        // fingerprint -> name
