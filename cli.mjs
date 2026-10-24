@@ -67,7 +67,7 @@ async function runNode(){
   const alertLog = path.join(dir, 'alerts.log');
   const node = new MeshNode({ identity: sc.loadIdentity(dir), name: c.name, host: c.host || '127.0.0.1', port: c.port,
     peers: c.peers, canarySecret: c.canarySecret, decoyPort: c.decoyPort, alertLog, handler,
-    heartbeatMs: c.heartbeatMs, deadMs: c.deadMs, canaryMs: c.canaryMs });
+    heartbeatMs: c.heartbeatMs, deadMs: c.deadMs, canaryMs: c.canaryMs, ...(c.limits || {}) });
   node.inbox = [];
   const log = (...x) => console.log(new Date().toISOString(), ...x);
   node.on('peer-up', (n, d) => log('peer up', n, d));

@@ -231,8 +231,11 @@ export async function serverHandshake(sock, identity, opts = {}){
 }
 
 export function listen({ host = '127.0.0.1', port, identity, ...opts }, onChannel, onError = () => {}){
+  const { gate, ...hsOpts } = opts;
   const srv = net.createServer((sock) => {
-    serverHandshake(sock, identity, opts).then(onChannel, onError);
+    // Optional pre-handshake gate (e.g. per-IP rate limit) so floods never reach the crypto.
+    if (gate && !gate(sock)){ sock.destroy(); return; }
+    serverHandshake(sock, identity, hsOpts).then(onChannel, onError);
   });
   srv.listen(port, host);
   return srv;

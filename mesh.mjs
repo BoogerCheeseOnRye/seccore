@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import * as sc from './seccore.mjs';
+import { KeyedLimiter } from './ratelimit.mjs';
 
 const MAX_CTL_BODY = 256 * 1024;
 const safeEq = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
@@ -36,6 +37,9 @@ export class MeshNode extends EventEmitter {
     this.peers = new Map();                       // name -> state
     this.byFp = new Map();                        // fingerprint -> name
     for (const p of opts.peers || []) this.addPeer(p, false);
+    // Per-peer message/request budget and per-IP handshake budget.
+    this.msgLimit = new KeyedLimiter(this.o.peerRate ?? 50, this.o.peerBurst ?? 100);
+    this.hsLimit = new KeyedLimiter(this.o.handshakeRate ?? 2, this.o.handshakeBurst ?? 10);
     this.pending = new Map();                     // request id -> {resolve,reject,timer}
     this.alerts = [];
     this.stopped = false;
@@ -55,7 +59,7 @@ export class MeshNode extends EventEmitter {
   async start(){
     const tasks = [];
     if (this.o.port != null){
-      this.server = sc.listen({ host: this.o.host, port: this.o.port, identity: this.id, pins: this._pins(), rekeyMessages: this.o.rekeyMessages },
+      this.server = sc.listen({ host: this.o.host, port: this.o.port, identity: this.id, pins: this._pins(), rekeyMessages: this.o.rekeyMessages, gate: (sock) => this._gate(sock) },
         (ch) => this._attach(ch, 'in'),
         (e) => this._alert('handshake-rejected', null, e.message));
       tasks.push(new Promise((r, j) => { this.server.once('listening', r); this.server.once('error', j); }));
@@ -72,6 +76,18 @@ export class MeshNode extends EventEmitter {
     this.hbTimer = setInterval(() => this._tick(), this.o.heartbeatMs); this.hbTimer.unref?.();
     if (this.o.canarySecret){ this.canaryTimer = setInterval(() => this._canaryAll(), this.o.canaryMs); this.canaryTimer.unref?.(); }
     return this;
+  }
+  _gate(sock){
+    const ip = sock.remoteAddress || '?';
+    if (this.hsLimit.take(ip)) return true;
+    this._rlAlert('handshake-rate', null, ip);
+    return false;
+  }
+  // Throttle alert spam: at most one rate-limit alert per key per 10 s.
+  _rlAlert(kind, peer, key){
+    this._rlSeen ??= new Map(); const k = kind + '|' + key, now = Date.now();
+    if (now - (this._rlSeen.get(k) || 0) < 10_000) return;
+    this._rlSeen.set(k, now); this._alert(kind, peer, 'rate limit exceeded by ' + key);
   }
   get port(){ return this.server?.address()?.port; }
   get decoyPort(){ return this.decoy?.address()?.port; }
@@ -127,6 +143,11 @@ export class MeshNode extends EventEmitter {
     let m; try { m = JSON.parse(raw.toString('utf8')); } catch { return this._alert('malformed', name, 'non-JSON frame'); }
     if (!m || typeof m !== 'object') return;
     // `from` is always the authenticated channel identity, never a field the peer wrote.
+    if ((m.t === 'msg' || m.t === 'req' || m.t === 'relay') && !this.msgLimit.take(name)){
+      this._rlAlert('peer-rate', name, name);
+      if (m.t === 'req') this._safeWrite(name, { t: 'res', id: m.id, ok: false, error: 'rate limited' });
+      return;
+    }
     switch (m.t){
       case 'hb': return this._safeWrite(name, { t: 'hbAck', ts: m.ts });
       case 'hbAck': if (typeof m.ts === 'number') st.rtt = Date.now() - m.ts; return;
